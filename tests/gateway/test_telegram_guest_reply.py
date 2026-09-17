@@ -1128,7 +1128,11 @@ async def test_guest_prompt_without_any_surface_fails_definitively():
     assert "42" not in adapter._pending_guest_queries
     fallback = await adapter.send("42", "❓ Confirm the reminder?")
     assert fallback.success is False
-    assert fallback.error == "guest_no_inline_message"
+    # Names the reason: this is the retry of a prompt that could not be drawn, and the turn is
+    # blocked on its answer, so buffering it would park the waiter on an invisible question.
+    assert fallback.error == "guest_prompt_undeliverable"
+    # The flag is one-shot (one retry), and the no-surface check still refuses what follows.
+    assert (await adapter.send("42", "anything else")).error == "guest_no_inline_message"
 
 
 @pytest.mark.asyncio
@@ -1438,3 +1442,185 @@ async def test_a_real_member_message_clears_the_guest_only_marking():
     adapter._note_member_chat(update)
 
     assert "42" not in adapter._known_guest_chats
+
+
+# ---------------------------------------------------------------------------
+# Clarify batches on one surface
+#
+# An ordinary chat gives every question its own message. A guest chat has one,
+# and the batch path has two writers racing for it: the loop echoing "you
+# answered X", and the agent thread that the same resolve() just unblocked,
+# drawing the next question. The echo is two awaits behind, so it lands last and
+# replaces a live question — keyboard and all — and the turn waits forever on a
+# card nobody can see.
+# ---------------------------------------------------------------------------
+
+def _guest_prompt_adapter(imi="imi_abc"):
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    adapter._guest_inline_message_ids["42"] = imi
+    adapter._guest_chat_types["42"] = "supergroup"
+    adapter._remember_guest_inline_message("42", imi)
+    return adapter
+
+
+def _tap(adapter, *, data, imi="imi_abc"):
+    query = MagicMock()
+    query.message = None
+    query.inline_message_id = imi
+    query.data = data
+    query.from_user = MagicMock(id=999, first_name="Alex", username="alex")
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    return query
+
+
+@pytest.mark.asyncio
+async def test_batch_next_question_survives_the_answer_echo(clarify_session):
+    """The reported hang: q1 is drawn, then the echo lands and wipes it. It must not."""
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    clarify_gateway.register("q0", session_key, "Which hand?", ["Left (A-117)", "Right (B-902)"])
+    adapter._clarify_state["q0"] = session_key
+    query = _tap(adapter, data="cl:q0:0")
+    cb = adapter._callback_ctx(query)
+
+    async def _draw_next_question(*_a, **_kw):
+        """What the unblocked agent thread does the moment the tap resolves q0."""
+        await adapter.send_clarify(
+            chat_id="42", question="Pick a word", choices=["Hello"], clarify_id="q1",
+            session_key=session_key)
+
+    with patch.object(adapter, "_callback_authorized", new=AsyncMock(return_value=True)), \
+         patch("tools.clarify_gateway.resolve_gateway_clarify", side_effect=lambda *a: True), \
+         patch.object(adapter, "_record_guest_answer", wraps=adapter._record_guest_answer):
+        await _draw_next_question()          # q1 lands on the surface (generation bumps)
+        await adapter._handle_clarify_callback(query, "cl:q0:0", cb)
+
+    # The echo captured the older generation, so it is dropped rather than replacing q1.
+    query.edit_message_text.assert_not_called()
+    last = adapter._bot.edit_message_text.await_args
+    assert "Pick a word" in last.kwargs["text"]
+    assert last.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_batch_answer_stays_on_screen_above_the_next_question(clarify_session):
+    """One surface: without carrying answers forward, q0's answer vanishes when q1 is drawn."""
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    clarify_gateway.register("q0", session_key, "Which hand?", ["Left (A-117)", "Right (B-902)"])
+    adapter._clarify_state["q0"] = session_key
+    query = _tap(adapter, data="cl:q0:0")
+    cb = adapter._callback_ctx(query)
+
+    with patch.object(adapter, "_callback_authorized", new=AsyncMock(return_value=True)), \
+         patch("tools.clarify_gateway.resolve_gateway_clarify", side_effect=lambda *a: True):
+        await adapter._handle_clarify_callback(query, "cl:q0:0", cb)
+    # Recorded before the resolve, so the draw that the resolve releases already sees it.
+    assert adapter._guest_answered_lines["42"] == [("Which hand?", "Left (A-117)")]
+
+    await adapter.send_clarify(
+        chat_id="42", question="Pick a word", choices=["Hello"], clarify_id="q1",
+        session_key=session_key)
+
+    drawn = adapter._bot.edit_message_text.await_args.kwargs["text"]
+    assert "Which hand?" in drawn and "Left (A-117)" in drawn  # the answer is still on screen
+    assert "Pick a word" in drawn
+
+
+@pytest.mark.asyncio
+async def test_single_question_echo_is_still_the_final_state(clarify_session):
+    """Regression guard for §4: with nothing drawn after it, the echo must land."""
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    clarify_gateway.register("only", session_key, "Which hand?", ["Left", "Right"])
+    adapter._clarify_state["only"] = session_key
+    query = _tap(adapter, data="cl:only:1")
+    cb = adapter._callback_ctx(query)
+
+    with patch.object(adapter, "_callback_authorized", new=AsyncMock(return_value=True)), \
+         patch("tools.clarify_gateway.resolve_gateway_clarify", side_effect=lambda *a: True):
+        await adapter._handle_clarify_callback(query, "cl:only:1", cb)
+
+    query.edit_message_text.assert_awaited_once()
+    assert "Right" in query.edit_message_text.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_three_question_batch_walks_through_every_question(clarify_session):
+    """Each question replaces the last, keeping the answers so far above it."""
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+
+    for idx, question in enumerate(("First?", "Second?", "Third?")):
+        result = await adapter.send_clarify(
+            chat_id="42", question=question, choices=["a", "b"], clarify_id=f"q{idx}",
+            session_key=session_key)
+        assert result.success is True
+        adapter._record_guest_answer("42", question, f"answer {idx}")
+
+    drawn = [c.kwargs["text"] for c in adapter._bot.edit_message_text.await_args_list]
+    assert "First?" in drawn[0] and "Second?" in drawn[1] and "Third?" in drawn[2]
+    assert "answer 0" in drawn[1]              # q0's answer rides above q1
+    assert "answer 0" in drawn[2] and "answer 1" in drawn[2]
+    # Every question bumped the surface, so any write decided before them is stale.
+    assert adapter._guest_surface_generation("42") == 3
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_tap_during_a_batch_neither_resolves_nor_advances(clarify_session):
+    """Fail-closed stays fail-closed: no resolution, no recorded answer, no surface write."""
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    clarify_gateway.register("q0", session_key, "Which hand?", ["Left", "Right"])
+    adapter._clarify_state["q0"] = session_key
+    query = _tap(adapter, data="cl:q0:0")
+    cb = adapter._callback_ctx(query)
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=False), \
+         patch("tools.clarify_gateway.resolve_gateway_clarify") as resolve:
+        await adapter._handle_clarify_callback(query, "cl:q0:0", cb)
+
+    resolve.assert_not_called()
+    assert "42" not in adapter._guest_answered_lines
+    query.edit_message_text.assert_not_called()
+    assert clarify_gateway.has_pending(session_key) is True
+
+
+@pytest.mark.asyncio
+async def test_opc_does_not_overwrite_a_question_drawn_while_it_flushed(clarify_session):
+    """The guard is a property of the surface, not of one call order: OPC obeys it too."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, _clarify_gateway, session_key = clarify_session
+    adapter._guest_reply_buffer["42"] = "Here is the answer."
+    # A question landed on the surface after the flush's generation was captured.
+    adapter._guest_surface_generations["42"] = 5
+    event = MagicMock()
+    event.source.chat_id = "42"
+
+    # The flush reads the generation twice: once to capture what it is writing against, once at
+    # the gate. A question drawn in between is exactly the 5 → 6 the side effect models.
+    with patch.object(adapter, "_guest_surface_generation", side_effect=[5, 6]):
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_next_question_fails_instead_of_parking_the_turn(clarify_session):
+    """§6: q1 that cannot be drawn must report failure, so the batch reports timed_out."""
+    adapter, _clarify_gateway, session_key = clarify_session
+    adapter._bot.edit_message_text = AsyncMock(side_effect=RuntimeError("Bad Request: message can't be edited"))
+
+    result = await adapter.send_clarify(
+        chat_id="42", question="Pick a word", choices=["Hello"], clarify_id="q1",
+        session_key=session_key)
+
+    assert result.success is False
+    # The gateway retries the card once as plain text; that retry must fail too, or the turn
+    # blocks in wait_for_response on a question that was never rendered.
+    retry = await adapter.send("42", "❓ Pick a word\n\n  1. Hello")
+    assert retry.success is False
+    assert retry.error == "guest_prompt_undeliverable"

@@ -566,6 +566,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Chats only ever reached as a guest. Outlives the turn so an advisory send that lands
         # between turns is refused cleanly instead of spending a request on a certain "Forbidden".
         self._known_guest_chats: Dict[str, float] = {}
+        # chat_id → generation of the one inline message that chat has. Bumped by every question
+        # drawn on it; a write that captured an older generation is dropped rather than allowed to
+        # clobber a newer one (see _guest_surface_write_is_stale).
+        self._guest_surface_generations: Dict[str, int] = {}
+        # chat_id → [(question, answer)] already answered in this turn's clarify batch. One surface
+        # means the next question REPLACES the previous card, so these ride along above it.
+        self._guest_answered_lines: Dict[str, List[tuple]] = {}
+        # Chats whose last control prompt could not be drawn. Consumed by the next non-stream
+        # send() so the gateway's plain-text retry of that prompt fails too instead of buffering
+        # into a void the turn cannot flush while it waits for that prompt's answer.
+        self._guest_prompt_undeliverable: set = set()
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -3602,6 +3613,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     # feedback — no content classification, the stub always fires.
                     if self._guest_inline_message_ids.get(_cid_str) is False:
                         await self._guest_fire_text_stub(_cid_str)
+                    if _cid_str in self._guest_prompt_undeliverable:
+                        # The prompt this text is retrying could not be drawn. Buffering it would
+                        # report success for something only on_processing_complete can show, and
+                        # OPC cannot run until the question is answered — the parked-waiter hang.
+                        self._guest_prompt_undeliverable.discard(_cid_str)
+                        logger.warning(
+                            "[%s] Refusing the plain-text retry of an undeliverable guest prompt (chat=%s)",
+                            self.name, _cid_str)
+                        return SendResult(success=False, error="guest_prompt_undeliverable")
                     if not self._guest_has_delivery_surface(_cid_str):
                         # Neither an inline message to edit nor an unspent query: this text can
                         # never reach the chat. Reporting success here is what let an
@@ -4542,7 +4562,7 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             await query.answer()  # e.g. page-counter button "mx:noop"
 
-    async def _notify_clarify_expired(self, query, user_display: str) -> None:
+    async def _notify_clarify_expired(self, query, user_display: str, *, generation: Optional[int] = None) -> None:
         """Tell the user a clarify tap arrived too late (entry evicted or gateway restarted) — otherwise
         the tap leaves a misleading ✓ the agent never sees."""
         with contextlib.suppress(Exception):
@@ -4550,7 +4570,8 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._edit_html_quiet(
             query,
             f"❓ {_html.escape(self._callback_prompt_text(query))}"
-            "\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>")
+            "\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>",
+            generation=generation)
 
     def _log_callback_edit_failure(self, query, exc: Exception) -> None:
         """Log a post-tap edit that failed: debug for an ordinary message, warning for an inline one.
@@ -4565,19 +4586,28 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             logger.debug("[%s] callback edit failed: %s", self.name, _redact_telegram_error_text(exc))
 
-    async def _edit_html_quiet(self, query, text: str) -> None:
+    async def _edit_html_quiet(self, query, text: str, *, generation: Optional[int] = None) -> None:
         """HTML edit with the keyboard removed; failures are non-fatal but never silent.
 
         PTB targets ``inline_message_id`` automatically when ``query.message`` is None, so this
-        works unchanged for a guest prompt.
+        works unchanged for a guest prompt. ``generation`` (from ``cb["guest_generation"]``) makes
+        the edit drop itself when the one guest surface has moved on to a newer question — without
+        it this write strips that question's keyboard and the turn waits on an invisible card.
         """
+        if self._guest_surface_write_is_stale(query, generation):
+            return
         try:
             await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as exc:
             self._log_callback_edit_failure(query, exc)
 
-    async def _edit_md_quiet(self, query, text_md: str) -> None:
-        """MarkdownV2 edit with the keyboard removed; failures are non-fatal but never silent."""
+    async def _edit_md_quiet(self, query, text_md: str, *, generation: Optional[int] = None) -> None:
+        """MarkdownV2 edit with the keyboard removed; failures are non-fatal but never silent.
+
+        ``generation`` drops the edit when the guest surface has moved on (see _edit_html_quiet).
+        """
+        if self._guest_surface_write_is_stale(query, generation):
+            return
         try:
             await query.edit_message_text(
                 text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
@@ -4655,11 +4685,18 @@ class TelegramAdapter(BasePlatformAdapter):
             guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
             return {
                 "chat_id": (guest or {}).get("chat_id"), "chat_type": (guest or {}).get("chat_type"),
-                "thread_id": None, "user_name": getattr(getattr(query, "from_user", None), "first_name", None)}
+                "thread_id": None, "user_name": getattr(getattr(query, "from_user", None), "first_name", None),
+                # Read BEFORE the handler resolves anything: resolving releases the thread that
+                # draws the batch's next question, and whatever this tap decides to write is
+                # stale from that moment on.
+                "guest_generation": self._guest_surface_generation((guest or {}).get("chat_id") or "")}
         query_chat = getattr(query_message, "chat", None)
         return {
             "chat_id": getattr(query_message, "chat_id", None), "chat_type": getattr(query_chat, "type", None),
-            "thread_id": getattr(query_message, "message_thread_id", None), "user_name": getattr(query.from_user, "first_name", None)}
+            "thread_id": getattr(query_message, "message_thread_id", None),
+            "user_name": getattr(query.from_user, "first_name", None),
+            # An ordinary chat gives every card its own message, so there is nothing to race for.
+            "guest_generation": None}
 
     def _callback_prompt_text(self, query) -> str:
         """Text of the message a tap came from — ``query.message.text``, or, for an inline
@@ -4766,7 +4803,7 @@ class TelegramAdapter(BasePlatformAdapter):
             label = "⌛ Approval expired"
             edit_text = f"{label} — no command was waiting. It already timed out (and was denied) or was resolved elsewhere."
         await query.answer(text=label)
-        await self._edit_md_quiet(query, edit_text)
+        await self._edit_md_quiet(query, edit_text, generation=cb.get("guest_generation"))
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
             self.resume_typing_for_chat(str(cb["chat_id"]))
@@ -4787,7 +4824,7 @@ class TelegramAdapter(BasePlatformAdapter):
         user_display = getattr(query.from_user, "first_name", "User")
         label = label_map.get(choice, "Resolved")
         await query.answer(text=label)
-        await self._edit_md_quiet(query, f"{label} by {user_display}")
+        await self._edit_md_quiet(query, f"{label} by {user_display}", generation=cb.get("guest_generation"))
         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
         try:
             from tools import slash_confirm as _slash_confirm_mod
@@ -4795,7 +4832,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if result_text and query.message is None:
                 # Inline prompt (guest chat): there is no chat to post a follow-up into — the
                 # message we just edited is the whole surface, so the result goes on it.
-                await self._edit_md_quiet(query, f"{label} by {user_display}\n\n{result_text}")
+                await self._edit_md_quiet(
+                    query, f"{label} by {user_display}\n\n{result_text}",
+                    generation=cb.get("guest_generation"))
             elif result_text and query.message:
                 # Inherit the prompt's topic: forums use message_thread_id; private DM-topic lanes need
                 # both the topic id and the prompt reply anchor.
@@ -4846,13 +4885,14 @@ class TelegramAdapter(BasePlatformAdapter):
             if not flipped:
                 # Entry evicted / gateway restarted — a typed answer would go nowhere.
                 self._clarify_state.pop(clarify_id, None)
-                await self._notify_clarify_expired(query, user_display)
+                await self._notify_clarify_expired(query, user_display, generation=cb.get("guest_generation"))
                 return
             await query.answer(text="✏️ Type your answer in the chat.")
             await self._edit_html_quiet(
                 query,
                 f"❓ {self._callback_prompt_text(query)}"
-                f"\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>")
+                f"\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
+                generation=cb.get("guest_generation"))
             return
         # Numeric choice → resolve immediately with the chosen text
         try:
@@ -4861,9 +4901,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="Invalid choice.")
             return
         resolved_text: Optional[str] = None
+        question_text = ""
         try:
             from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
             entry = _clarify_entries.get(clarify_id)
+            question_text = getattr(entry, "question", "") or ""
             if entry and entry.choices and 0 <= idx < len(entry.choices):
                 resolved_text = entry.choices[idx]
         except Exception:
@@ -4872,6 +4914,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # Race (timeout / session reset): echo the index so the agent sees an intentional response.
             resolved_text = f"choice {idx + 1}"
         self._clarify_state.pop(clarify_id, None)
+        # Record BEFORE resolving: resolving is what releases the thread that draws the batch's
+        # next question, and that draw renders this list above it. Recorded after, it would always
+        # lose the race and the answer would simply vanish from the one surface the chat has.
+        if cb.get("guest_generation") is not None:
+            self._record_guest_answer(cb.get("chat_id") or "", question_text, resolved_text)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
             resolved = resolve_gateway_clarify(clarify_id, resolved_text)
@@ -4883,11 +4930,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_html_quiet(
                 query,
                 f"❓ {_html.escape(self._callback_prompt_text(query))}"
-                f"\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
+                f"\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}",
+                generation=cb.get("guest_generation"))
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
         else:
             # Entry evicted / gateway restarted between ask and tap.
-            await self._notify_clarify_expired(query, user_display)
+            await self._notify_clarify_expired(query, user_display, generation=cb.get("guest_generation"))
             logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
@@ -4896,7 +4944,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
             return
         await query.answer(text=f"Sent '{answer}' to the update process.")
-        await self._edit_md_quiet(query, f"☤ Update prompt answered: *{'Yes' if answer == 'y' else 'No'}*")
+        await self._edit_md_quiet(
+            query, f"☤ Update prompt answered: *{'Yes' if answer == 'y' else 'No'}*",
+            generation=cb.get("guest_generation"))
         try:
             from hermes_constants import get_hermes_home
             response_path = get_hermes_home() / ".update_response"
@@ -5687,7 +5737,8 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_inline_message_ids", dict), ("_guest_turn_media", dict), ("_guest_turn_media_all", dict),
         ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
         ("_guest_chat_types", dict), ("_guest_inline_chats", dict), ("_guest_prompt_texts", dict),
-        ("_known_guest_chats", dict),
+        ("_known_guest_chats", dict), ("_guest_surface_generations", dict),
+        ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -6891,12 +6942,104 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         return getattr(sent, "inline_message_id", None)
 
+    # -- One surface, several writers -----------------------------------------
+    #
+    # A guest chat has exactly ONE message the bot can write: the inline message behind
+    # _guest_inline_message_ids. The clarify batch path was written for a platform that
+    # gives each question its own message, and with one surface its two writers race —
+    # the asyncio loop echoing "you answered X" onto the card, and the agent thread that
+    # the same resolve() just unblocked, drawing the batch's NEXT question. The echo is
+    # two awaits behind, so it lands last and replaces a live question (with
+    # reply_markup=None, taking its keyboard with it). The turn then waits forever on a
+    # question nobody can see.
+    #
+    # The guard makes "an older write never overwrites a newer one" a property of the
+    # surface rather than of one call order: every question drawn bumps a per-chat
+    # generation, and a write that captured an older one is dropped.
+
+    def _guest_surface_generation(self, chat_id: Any) -> int:
+        """Current generation of *chat_id*'s inline message."""
+        self._ensure_guest_state()
+        return self._guest_surface_generations.get(str(chat_id), 0)
+
+    def _guest_surface_moved(self, chat_id: Any, generation: Optional[int]) -> bool:
+        """Whether *chat_id*'s surface has newer content than *generation* — i.e. this write lost.
+
+        Dropping the write is the point: the newer content is a question the turn is waiting on,
+        and overwriting it (with ``reply_markup=None``, no less) is what left the user looking at
+        an answered card while the turn blocked on one they never saw.
+        """
+        if generation is None:
+            return False
+        current = self._guest_surface_generation(chat_id)
+        if current <= generation:
+            return False
+        logger.info(
+            "[%s] Dropping stale guest surface write (chat=%s captured_gen=%s current_gen=%s)",
+            self.name, str(chat_id), generation, current)
+        return True
+
+    def _guest_surface_write_is_stale(self, query: Any, generation: Optional[int]) -> bool:
+        """``_guest_surface_moved`` for a button tap, whose chat comes from the inline message.
+
+        *generation* is what the surface was at when the caller decided WHAT to write — captured
+        in ``_callback_ctx`` before the tap resolved anything.
+        """
+        if generation is None:
+            return False
+        guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
+        if not guest:
+            return False
+        return self._guest_surface_moved(str(guest.get("chat_id") or ""), generation)
+
+    # Answered questions kept above the pending one. Three keeps the card readable and well
+    # inside Telegram's 4,096-character limit even with long questions.
+    _GUEST_ANSWERED_HISTORY_MAX = 3
+    _GUEST_ANSWERED_LINE_MAX = 160
+
+    def _record_guest_answer(self, chat_id: Any, question: str, answer: str) -> None:
+        """Remember an answered clarify so the batch's next card can keep it on screen.
+
+        Recorded BEFORE the clarify is resolved, which is what makes it deterministic: resolving
+        is what releases the thread that draws the next question, so by the time that draw reads
+        this list the entry is already in it.
+        """
+        if not question and not answer:
+            return
+        self._ensure_guest_state()
+        cid = str(chat_id)
+        lines = self._guest_answered_lines.setdefault(cid, [])
+        lines.append((str(question).strip(), str(answer).strip()))
+        del lines[:-self._GUEST_ANSWERED_HISTORY_MAX]
+
+    def _guest_answered_prefix(self, chat_id: Any, parse_mode: Any) -> str:
+        """Answered questions of this batch, rendered above the pending one (HTML prompts only).
+
+        With one surface the next question REPLACES the previous card, so without this the user's
+        own answer vanishes the moment the batch advances. HTML-only by construction: the prompts
+        that come in batches (clarify, exec approval) are HTML, and rendering these lines into a
+        MarkdownV2 prompt would mean escaping them a second, incompatible way.
+        """
+        if parse_mode != ParseMode.HTML:
+            return ""
+        lines = self._guest_answered_lines.get(str(chat_id)) or []
+        if not lines:
+            return ""
+        rendered = "\n".join(
+            f"✅ <i>{_html.escape(q[:self._GUEST_ANSWERED_LINE_MAX])}</i> — "
+            f"<b>{_html.escape(a[:self._GUEST_ANSWERED_LINE_MAX])}</b>"
+            for q, a in lines if q or a)
+        return f"{rendered}\n\n" if rendered else ""
+
     def _finish_guest_prompt(
         self, chat_id: str, inline_message_id: str, text: str, on_sent, *, parse_mode: Any,
     ) -> None:
         """Bookkeeping after a guest prompt is on screen: retarget edits, record the tap context."""
         cid = str(chat_id)
         self._guest_inline_message_ids[cid] = inline_message_id
+        # Newest content on the surface: anything decided before this point is now stale.
+        self._guest_surface_generations[cid] = self._guest_surface_generation(cid) + 1
+        self._guest_prompt_undeliverable.discard(cid)
         # Stored unescaped so a handler echoing it produces what the user is reading, matching
         # what ``query.message.text`` would have given for an ordinary message.
         stored = _html.unescape(text) if parse_mode == ParseMode.HTML else text
@@ -6913,6 +7056,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         cid = str(chat_id)
+        # Keep what the user already answered in this batch on screen: the next question replaces
+        # the card, so a plain replace would drop their own answers one by one.
+        text = self._guest_answered_prefix(cid, parse_mode) + text
         imi = self._guest_inline_message_ids.get(cid)
         if not isinstance(imi, str):
             # False → nothing drawn yet (no typing, no tool progress before the prompt): spend the
@@ -6926,6 +7072,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # plain-text fallback fails too: a "delivered" prompt nobody can see is what
                 # turned this into a silent wait instead of an error the agent can act on.
                 self._pending_guest_queries.pop(cid, None)
+                self._guest_prompt_undeliverable.add(cid)
                 logger.warning(
                     "[%s] %s: no inline message to draw on in guest chat %s — prompt undeliverable",
                     self.name, what, cid)
@@ -6936,6 +7083,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._bot.edit_message_text(
                 text=text, inline_message_id=imi, parse_mode=parse_mode, reply_markup=keyboard)
         except Exception as exc:
+            # Same reasoning as the no-surface branch above: the gateway retries a failed card
+            # once as plain text, and in a guest chat that text only reaches the buffer, which is
+            # flushed at the END of the turn — a turn that cannot end while it waits for the
+            # answer to the question that just failed to render.
+            self._guest_prompt_undeliverable.add(cid)
             logger.warning(
                 "[%s] %s: guest inline edit failed (imi=%s): %s",
                 self.name, what, imi, _redact_telegram_error_text(exc))
@@ -6997,6 +7149,18 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] session-key derivation failed", self.name, exc_info=True)
             return None
+
+    def _pending_guest_question(self, event: MessageEvent) -> str:
+        """Question text of the clarify this event answers, for the on-screen batch history."""
+        session_key = self._gateway_session_key(event)
+        if not session_key:
+            return ""
+        try:
+            from tools.clarify_gateway import get_pending_for_session
+            return getattr(get_pending_for_session(session_key, include_choice_prompts=True), "question", "") or ""
+        except Exception:
+            logger.debug("[%s] pending clarify lookup failed", self.name, exc_info=True)
+            return ""
 
     def _is_guest_clarify_continuation(self, event: MessageEvent) -> bool:
         """Whether *event* is the typed answer the in-flight guest turn is blocked waiting for.
@@ -7142,6 +7306,11 @@ class TelegramAdapter(BasePlatformAdapter):
             _continuation = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
             _continuation.text = self._clean_bot_trigger_text(_continuation.text)
             if self._is_guest_clarify_continuation(_continuation):
+                # Same reason as the button path: record the answer BEFORE the gateway intercept
+                # resolves it, so the batch's next question can keep it on screen. The predicate
+                # above has already established this text resolves the pending question.
+                self._record_guest_answer(
+                    chat_id_str, self._pending_guest_question(_continuation), _continuation.text)
                 # The fresh query id this message arrived with is answered on the spot: the turn
                 # keeps writing to the ORIGINAL inline message, so without this the caller's own
                 # message would sit there unanswered.
@@ -7973,13 +8142,21 @@ class TelegramAdapter(BasePlatformAdapter):
             # _guest_media_send). A guest bot cannot push a file into a chat it hasn't
             # joined, so the reply carries a button per file instead; tapping it sends
             # deliver_<token> back and that query is answered with the cached media.
+            # Captured before the flush so a question drawn while it runs (a late clarify on
+            # another thread) is not overwritten by what is, by then, a stale final answer.
+            _guest_gen = self._guest_surface_generation(_gc_id)
+            self._guest_answered_lines.pop(_gc_id, None)
+            self._guest_prompt_undeliverable.discard(_gc_id)
             _guest_media_all = self._guest_turn_media_all.pop(_gc_id, None) or []
             _guest_media_latest = self._guest_turn_media.pop(_gc_id, None)
             if not _guest_media_all and _guest_media_latest:
                 _guest_media_all = [_guest_media_latest]
             self._guest_media_group_ids.pop(_gc_id, None)
             self._guest_only_chats.discard(_gc_id)
-            if (_guest_qid or _guest_imi) and self._bot:
+            # ``_guest_surface_moved``: a question drawn while this flush was being prepared is
+            # still unanswered, and overwriting it with what is by then a stale final answer is the
+            # lost update this guard exists to stop. It logs its own reason when it fires.
+            if (_guest_qid or _guest_imi) and self._bot and not self._guest_surface_moved(_gc_id, _guest_gen):
                 _plain = _strip_mdv2(self.format_message(_buffered)).strip() if _buffered else ""
                 # Strip any leading MEDIA artifact that escaped stream-consumer cleanup.
                 _plain = re.sub(r"(?i)^MEDIA:?\s*\S*\s*", "", _plain).strip()

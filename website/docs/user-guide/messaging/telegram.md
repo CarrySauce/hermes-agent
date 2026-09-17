@@ -1176,6 +1176,12 @@ gateway restart, say) is refused rather than evaluated without context. If there
 to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
 answer to a question nobody could see.
 
+**Several questions at once.** The agent can ask a batch. A guest chat has only that one message
+to work with, so the batch walks through it: each question replaces the last, with the answers
+given so far kept above it, and only the question currently being waited on carries a keyboard.
+Writes to that message are ordered — a late "you answered X" can never land on top of the next
+question and take its buttons with it.
+
 **Typed answers.** Tapping `✏️ Other`, or answering an open-ended question, means typing into the
 chat while the turn is still running. That message is recognised as the answer the turn is waiting
 for and routed into it, so the turn resumes; the bot acknowledges it and keeps writing its reply to
