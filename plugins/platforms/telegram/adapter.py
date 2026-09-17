@@ -119,6 +119,7 @@ try:
         InlineQueryResultArticle, InputTextMessageContent,
         InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo,
         InlineQueryResultCachedAudio, InlineQueryResultCachedDocument,
+        InlineQueryResultCachedMpeg4Gif,
     )
     try:
         from telegram import LinkPreviewOptions
@@ -138,6 +139,7 @@ except ImportError:
     InlineQueryResultArticle = InputTextMessageContent = Any
     InlineQueryResultCachedPhoto = InlineQueryResultCachedVideo = Any
     InlineQueryResultCachedAudio = InlineQueryResultCachedDocument = Any
+    InlineQueryResultCachedMpeg4Gif = Any
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -525,6 +527,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # _GUEST_UPDATE_ID_FILE and skip updates whose ids we've already processed.
         self._seen_guest_update_ids: set = set()
         self._last_guest_update_id: int = 0
+        # Attachments staged during the current guest turn: chat_id → the most recent
+        # {"file_id", "media_kind", ...} record, and the full per-turn list behind it.
+        # on_processing_complete turns these into deliver_<token> buttons (a guest bot
+        # cannot push a file into a chat it hasn't joined; the caller redeems it).
+        self._guest_turn_media: Dict[str, Dict[str, Any]] = {}
+        self._guest_turn_media_all: Dict[str, List[Dict[str, Any]]] = {}
+        # Staging cache: resolved path → {"mtime", "size", "file_id"}. A regenerated file at
+        # the same path (new mtime/size) re-uploads instead of serving the stale file_id.
+        self._guest_staged_file_ids: Dict[str, Dict[str, Any]] = {}
+        # chat_id → media_group_id of the album the in-flight guest turn is collecting, so the
+        # album's 2nd..Nth guest messages merge into that turn instead of hitting the busy reply.
+        self._guest_media_group_ids: Dict[str, str] = {}
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -4518,6 +4532,21 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[%s] inline picker empty answer failed", self.name, exc_info=True)
             return
+        # Attachment redemption: with inline mode enabled, the delivery button's pre-filled
+        # "@bot deliver_<token>" reaches us as an inline query instead of a guest message.
+        # Same token, same single use — answering here posts the file into the chat as the
+        # caller, which is exactly what the guest-message branch achieves the other way.
+        _inline_token = self._guest_delivery_token(getattr(inline_query, "query", "") or "")
+        if _inline_token:
+            from tools.guest_mode_tool import resolve_token
+            _record = resolve_token(_inline_token)
+            try:
+                await inline_query.answer(
+                    [self._guest_cached_media_result(_record, result_id="delivery")] if _record else [],
+                    cache_time=0, is_personal=True)
+            except Exception:
+                logger.debug("[%s] inline delivery answer failed", self.name, exc_info=True)
+            return
         try:
             from telegram import InlineQueryResultArticle, InputTextMessageContent
             from plugins.platforms.telegram.inline_picker import CACHE_TIME_SECONDS as _CACHE, build_inline_results
@@ -5041,6 +5070,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        _guest = await self._guest_stage_outbound(
+            chat_id, self._guest_media_kind_for_path(audio_path, is_voice=bool(kwargs.get("is_voice"))),
+            audio_path, caption=caption)
+        if _guest is not None:
+            return _guest
         _transcoded_voice_path: Optional[str] = None
         try:
             if not os.path.exists(audio_path):
@@ -5088,6 +5122,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         if not images:
             return SendResult(success=False, error="no images to send")
+        if self._is_guest_chat(chat_id):
+            return await self._guest_stage_outbound_images(chat_id, images)
         try:
             from telegram import InputMediaPhoto
         except Exception as exc:  # pragma: no cover - missing SDK
@@ -5161,6 +5197,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
+        _guest = await self._guest_stage_outbound(chat_id, "photo", image_path, caption=caption)
+        if _guest is not None:
+            return _guest
         # Pre-compress large raster images to progressive JPEG once; the photo send and the document
         # fallback both reuse the compressed file so either upload stays under media_write_timeout.
         compressed = self._compress_image_to_jpeg(image_path)
@@ -5222,6 +5261,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
+        _guest = await self._guest_stage_outbound(
+            chat_id, self._guest_media_kind_for_path(file_path), file_path, caption=caption,
+            file_name=file_name or os.path.basename(file_path))
+        if _guest is not None:
+            return _guest
         return await self._send_local_file(
             "File", file_path, chat_id, reply_to, metadata, "document",
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
@@ -5234,6 +5278,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a video natively as a Telegram video message."""
+        _guest = await self._guest_stage_outbound(chat_id, "video", video_path, caption=caption)
+        if _guest is not None:
+            return _guest
         return await self._send_local_file(
             "Video", video_path, chat_id, reply_to, metadata, "video",
             lambda f: {"video": f, "caption": self._caption_1024(caption)},
@@ -5516,6 +5563,28 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return whether non-allowlisted groups may trigger via direct @mention."""
         return self._extra_bool("guest_mode", "TELEGRAM_GUEST_MODE", "false")
 
+    # Every guest-mode container, with the factory that builds an empty one. Kept beside
+    # _ensure_guest_state so adding state can't leave a partially-initialized adapter behind.
+    _GUEST_STATE_DEFAULTS = (
+        ("_pending_guest_queries", dict), ("_guest_only_chats", set), ("_guest_reply_buffer", dict),
+        ("_guest_inline_message_ids", dict), ("_guest_turn_media", dict), ("_guest_turn_media_all", dict),
+        ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
+        ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
+    )
+
+    def _ensure_guest_state(self) -> None:
+        """Create any missing guest-mode bookkeeping, idempotently.
+
+        ``_is_guest_chat`` runs on every outbound message and the guest flush runs for every
+        completed turn, so neither may *require* this state to exist: an adapter built without
+        ``__init__`` (``object.__new__`` in tests, partial construction during a transient-init
+        rebuild) must still be able to send. Without this the guest feature would turn a missing
+        attribute into a failed send on a chat that has nothing to do with guest mode.
+        """
+        for name, factory in self._GUEST_STATE_DEFAULTS:
+            if not hasattr(self, name):
+                setattr(self, name, factory())
+
     def _is_guest_chat(self, chat_id: Any) -> bool:
         """Return whether *chat_id* is currently a guest-mode (non-member) chat.
 
@@ -5525,6 +5594,7 @@ class TelegramAdapter(BasePlatformAdapter):
         suppress normal ``sendMessage``-family calls in guest chats — the bot
         isn't a member, so those calls fail with ``Forbidden``.
         """
+        self._ensure_guest_state()
         _cid_str = str(chat_id)
         return self._pending_guest_queries.get(_cid_str) is not None or _cid_str in self._guest_only_chats
 
@@ -5952,6 +6022,21 @@ class TelegramAdapter(BasePlatformAdapter):
             event, text=self._telegram_group_observe_attributed_text(event),
             source=self._telegram_group_observe_shared_source(event.source), channel_prompt=channel_prompt)
 
+    # Mirrors the media filter _register_handlers installs for member chats
+    # (PHOTO | VIDEO | AUDIO | VOICE | Document.ALL | Sticker.ALL), so the guest
+    # path recognizes exactly the attachment kinds the member path handles.
+    _MEDIA_ATTRS = ("photo", "video", "audio", "voice", "document", "sticker")
+
+    def _message_has_media(self, msg: Any) -> bool:
+        """True when ``msg`` carries an attachment the media pipeline knows how to cache.
+
+        A Bot API message is either text or an attachment with an optional caption, never
+        both, so a populated ``text`` settles it without inspecting the attachment fields.
+        """
+        if getattr(msg, "text", None):
+            return False
+        return any(getattr(msg, attr, None) for attr in self._MEDIA_ATTRS)
+
     def _media_message_type(self, msg: Message) -> MessageType:
         """Classify a Telegram media message into a MessageType (first present attachment wins)."""
         for attr, mtype in (
@@ -6298,6 +6383,317 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] guest %s failed: %s", self.name, log_label, exc)
             return False
 
+    # -- Guest-mode attachments (Bot API 10.0) --------------------------------
+    #
+    # A guest bot cannot push a file into a chat it hasn't joined: every outbound
+    # sendPhoto/sendVideo/sendDocument there fails with "Forbidden: bot is not a
+    # member", and answerGuestQuery only accepts *cached* media (a file_id Telegram
+    # already holds). So guest attachments run in two hops:
+    #
+    #   1. staging   — the file is uploaded once to the operator's own home channel,
+    #                  which mints a file_id (``_guest_media_send``);
+    #   2. redemption — the reply carries a "switch_inline_query_current_chat" button
+    #                  whose payload is ``deliver_<token>``. Tapping it pre-fills that
+    #                  text for the caller; sending it arrives as a NEW guest message
+    #                  with a FRESH query id, which we answer with the cached media
+    #                  (the ``deliver_`` branch of ``_handle_guest_message_update``).
+    #
+    # Path containment is enforced at step 1: only files under ``HERMES_HOME/cache``
+    # can be staged. Without it a guest-triggered turn talked into naming an arbitrary
+    # host path (the credentials store, an .env) would have it uploaded to the home
+    # channel and made redeemable — the prompt asked the model to stage under the cache
+    # dir, but nothing made it.
+
+    _GUEST_MEDIA_CACHE_SUBDIR = "cache"
+    _GUEST_STAGED_CACHE_MAX = 128
+
+    def _guest_staging_chat_id(self) -> str:
+        """Chat used to mint file_ids for guest attachments (the bot must be a member).
+
+        Explicit ``guest_staging_chat``/``TELEGRAM_GUEST_STAGING_CHAT`` wins; otherwise the
+        home channel, which is the operator's own chat by construction.
+        """
+        explicit = _extra_or_secret(
+            self.config.extra, "guest_staging_chat", "TELEGRAM_GUEST_STAGING_CHAT", "", blank_is_unset=True)
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        home_env = _extra_or_secret(self.config.extra, "home_channel_chat_id", "TELEGRAM_HOME_CHANNEL", "")
+        if home_env and str(home_env).strip():
+            return str(home_env).strip()
+        home = getattr(self.config, "home_channel", None)
+        return str(getattr(home, "chat_id", "") or "").strip()
+
+    def _guest_media_kind_for_path(self, path: str, *, is_voice: bool = False) -> str:
+        """Map a local file to the staging/send kind Telegram should use for it."""
+        ext = os.path.splitext(path)[1].lower()
+        if is_voice or ext in {".ogg", ".opus"}:
+            return "voice"
+        if ext == ".gif":
+            return "animation"
+        if ext in _TELEGRAM_IMAGE_EXTENSIONS or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            return "photo"
+        if ext in {".mp4", ".mov", ".webm", ".mkv", ".m4v"}:
+            return "video"
+        if ext in {".mp3", ".m4a", ".wav", ".flac", ".aac"}:
+            return "audio"
+        return "document"
+
+    def _guest_media_staging_hint(self) -> str:
+        """The directory the model must write guest attachments into (shown in its prompt)."""
+        try:
+            import hermes_constants
+            return str(_Path(hermes_constants.get_hermes_home()) / self._GUEST_MEDIA_CACHE_SUBDIR)
+        except Exception:  # pragma: no cover - HERMES_HOME unreadable
+            return "~/.hermes/cache"
+
+    async def _guest_media_send(
+        self, chat_id: str, kind: str, path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Stage *path* into the home channel and remember its file_id for this guest turn.
+
+        Nothing is delivered here — ``on_processing_complete`` turns what this records into
+        the deliver button. Returns a failed ``SendResult`` (never raises) so the ordinary
+        send paths can degrade the way they already do for a refused upload.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        chat_id_str = str(chat_id)
+        # Resolution and containment are DELIBERATELY separate try blocks: a path resolve()
+        # itself chokes on (embedded null byte) must not fall into the containment handler
+        # with the resolved path unbound.
+        import hermes_constants
+        try:
+            resolved = _Path(path).resolve()
+            staging_root = (_Path(hermes_constants.get_hermes_home()) / self._GUEST_MEDIA_CACHE_SUBDIR).resolve()
+        except (ValueError, OSError) as exc:
+            logger.warning("[%s] guest media path validation failed: %s", self.name, exc)
+            return SendResult(success=False, error=f"guest media path validation failed: {exc}")
+        try:
+            resolved.relative_to(staging_root)
+        except ValueError:
+            logger.warning(
+                "[%s] guest media rejected: %s is outside the allowed staging directory %s",
+                self.name, resolved, staging_root)
+            return SendResult(
+                success=False,
+                error="guest media rejected: path is outside the allowed staging directory")
+        if not resolved.is_file():
+            return SendResult(success=False, error=self._missing_media_path_error("Guest media", str(resolved)))
+        staging_chat = self._guest_staging_chat_id()
+        if not staging_chat:
+            logger.warning(
+                "[%s] guest attachment dropped: no staging chat configured "
+                "(set TELEGRAM_HOME_CHANNEL or extra.guest_staging_chat)", self.name)
+            return SendResult(success=False, error="guest media staging chat not configured")
+
+        try:
+            stat = resolved.stat()
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+        except OSError as exc:
+            return SendResult(success=False, error=f"guest media path validation failed: {exc}")
+
+        key = str(resolved)
+        cached = self._guest_staged_file_ids.get(key)
+        file_id: Optional[str] = None
+        if cached and cached.get("fingerprint") == fingerprint:
+            # Same bytes as last time: reuse the file_id instead of re-uploading. A file
+            # REgenerated at the same path has a new mtime/size, so it re-stages.
+            file_id = cached.get("file_id")
+        if not file_id:
+            file_id = await self._guest_stage_file(staging_chat, kind, resolved, file_name)
+            if not file_id and kind == "photo":
+                # sendPhoto caps at ~10 MB (and refuses odd dimensions) where sendDocument
+                # takes 50 MB. The member path has the same document fallback; a delivered
+                # file beats a refused one.
+                logger.info("[%s] guest photo staging failed; retrying as a document", self.name)
+                kind = "document"
+                file_id = await self._guest_stage_file(staging_chat, kind, resolved, file_name)
+            if not file_id:
+                return SendResult(success=False, error="guest media staging failed")
+            self._guest_staged_file_ids[key] = {"fingerprint": fingerprint, "file_id": file_id}
+            # Bounded: a long-lived gateway must not accumulate one entry per file ever
+            # staged. Oldest insertion goes first (dicts keep insertion order).
+            while len(self._guest_staged_file_ids) > self._GUEST_STAGED_CACHE_MAX:
+                self._guest_staged_file_ids.pop(next(iter(self._guest_staged_file_ids)), None)
+
+        record: Dict[str, Any] = {
+            "file_id": file_id,
+            "media_kind": kind,
+            "caption": caption,
+            "file_name": file_name or resolved.name,
+        }
+        self._guest_turn_media[chat_id_str] = record
+        self._guest_turn_media_all.setdefault(chat_id_str, []).append(record)
+        logger.info(
+            "[%s] Staged guest attachment (chat=%s kind=%s file=%s)",
+            self.name, chat_id_str, kind, resolved.name)
+        return SendResult(success=True, message_id=None)
+
+    async def _guest_stage_file(
+        self, staging_chat: str, kind: str, resolved: _Path, file_name: Optional[str],
+    ) -> Optional[str]:
+        """Upload *resolved* to *staging_chat* and return the minted file_id (None on failure)."""
+        senders = {
+            "photo": ("send_photo", "photo", "photo"),
+            "video": ("send_video", "video", "video"),
+            "audio": ("send_audio", "audio", "audio"),
+            "voice": ("send_voice", "voice", "voice"),
+            "animation": ("send_animation", "animation", "animation"),
+            "document": ("send_document", "document", "document"),
+        }
+        method_name, kwarg, attr = senders.get(kind, senders["document"])
+        send = getattr(self._bot, method_name, None)
+        if send is None:
+            return None
+        try:
+            with open(resolved, "rb") as fh:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": normalize_telegram_chat_id(staging_chat), kwarg: fh,
+                    "disable_notification": True,
+                }
+                if kind == "document" and file_name:
+                    kwargs["filename"] = file_name
+                sent = await send(**kwargs)
+        except Exception as exc:
+            logger.warning(
+                "[%s] guest media staging upload failed (kind=%s file=%s): %s",
+                self.name, kind, resolved.name, _redact_telegram_error_text(exc))
+            return None
+        holder = getattr(sent, attr, None)
+        if isinstance(holder, (list, tuple)):  # PhotoSize list, largest last
+            holder = holder[-1] if holder else None
+        file_id = getattr(holder, "file_id", None)
+        if not file_id:
+            logger.warning("[%s] guest media staging returned no file_id (kind=%s)", self.name, kind)
+            return None
+        return str(file_id)
+
+    async def _guest_stage_outbound(
+        self, chat_id: str, kind: str, path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> Optional[SendResult]:
+        """Divert an outbound attachment into guest staging, or return None for normal chats.
+
+        Every native send path funnels through here so a MEDIA: attachment behaves the same
+        in a guest chat as in a DM from the model's point of view — it asks for a file to be
+        sent, and the file arrives; only the last hop (a button the caller taps) differs.
+        """
+        if not self._is_guest_chat(chat_id):
+            return None
+        return await self._guest_media_send(chat_id, kind, path, caption=caption, file_name=file_name)
+
+    async def _guest_stage_outbound_images(self, chat_id: str, images: List[tuple]) -> SendResult:
+        """Guest-chat counterpart of the album send: stage every local image of the batch."""
+        from urllib.parse import unquote as _unquote
+        staged = 0
+        for image_url, alt_text in images:
+            if not str(image_url).startswith("file://"):
+                # A remote URL has no local file to stage; the model's text still carries it.
+                continue
+            result = await self._guest_media_send(
+                chat_id, "photo", _unquote(str(image_url)[7:]), caption=alt_text or None)
+            staged += 1 if result.success else 0
+        if staged:
+            return SendResult(success=True, message_id=None)
+        return SendResult(success=False, error="no guest-deliverable images in batch")
+
+    def _guest_cached_media_result(self, record: Dict[str, Any], *, result_id: str = "delivery"):
+        """Build the ``InlineQueryResultCached*`` that hands *record*'s file to the guest chat."""
+        kind = record.get("media_kind") or "document"
+        file_id = record.get("file_id")
+        title = record.get("file_name") or "File"
+        caption = record.get("caption") or None
+        if kind == "photo":
+            return InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id, caption=caption)
+        if kind == "animation":
+            # An animation file_id is not a video file_id — Telegram rejects the swap.
+            return InlineQueryResultCachedMpeg4Gif(id=result_id, mpeg4_file_id=file_id, caption=caption)
+        if kind == "video":
+            return InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title=title, caption=caption)
+        if kind in {"audio", "voice"}:
+            return InlineQueryResultCachedAudio(id=result_id, audio_file_id=file_id, caption=caption)
+        return InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title=title, caption=caption)
+
+    _GUEST_MEDIA_BUTTON_LABELS = {
+        "photo": "🖼 Get the image", "video": "🎬 Get the video", "animation": "🎬 Get the GIF",
+        "audio": "🎵 Get the audio", "voice": "🎤 Get the voice note", "document": "📎 Get the file",
+    }
+    # Telegram renders at most a handful of buttons legibly, and each one holds a live token.
+    _GUEST_MEDIA_MAX_BUTTONS = 4
+
+    def _guest_media_keyboard(self, records: List[Dict[str, Any]]):
+        """Mint one delivery token per staged file and return (markup, hint_line).
+
+        Returns ``(None, "")`` when there is nothing to offer, so callers can keep the
+        plain-text path untouched.
+        """
+        offered = [r for r in records if r.get("file_id")][: self._GUEST_MEDIA_MAX_BUTTONS]
+        if not offered:
+            return None, ""
+        from tools.guest_mode_tool import mint_token
+        rows = []
+        for record in offered:
+            token = mint_token(
+                record["file_id"], record.get("media_kind") or "document",
+                caption=record.get("caption"), file_name=record.get("file_name"))
+            label = self._GUEST_MEDIA_BUTTON_LABELS.get(record.get("media_kind") or "document", "📎 Get the file")
+            if len(offered) > 1 and record.get("file_name"):
+                label = f"{label.split(' ', 1)[0]} {record['file_name'][:24]}"
+            rows.append([InlineKeyboardButton(label, switch_inline_query_current_chat=f"deliver_{token}")])
+        dropped = len(records) - len(offered)
+        hint = "✅ Ready — tap below to get %s here." % ("the file" if len(offered) == 1 else "the files")
+        if dropped > 0:
+            hint += f" ({dropped} more couldn't be attached in one reply.)"
+        return InlineKeyboardMarkup(rows), hint
+
+    # token_urlsafe(16) → 22 URL-safe characters; the optional @handle is what
+    # switch_inline_query_current_chat pre-fills in front of the payload.
+    _GUEST_DELIVERY_RE = re.compile(r"^(?:@[A-Za-z0-9_]{1,64}\s+)?deliver_([A-Za-z0-9_-]{8,64})$")
+
+    def _guest_delivery_token(self, text: Optional[str]) -> Optional[str]:
+        """The token of a ``deliver_<token>`` request, or None when *text* isn't one.
+
+        The button uses ``switch_inline_query_current_chat``, which pre-fills the caller's
+        input box with the bot's @handle followed by the payload — so the mention may or may
+        not survive into the text that reaches us. Both shapes resolve here, and anything
+        else (prose that merely starts with "deliver_") does not.
+        """
+        candidates = [(text or "").strip()]
+        with contextlib.suppress(Exception):
+            candidates.append(self._clean_bot_trigger_text(text or "").strip())
+        for candidate in candidates:
+            match = self._GUEST_DELIVERY_RE.match(candidate)
+            if match:
+                return match.group(1)
+        return None
+
+    async def _handle_guest_delivery_request(self, guest_query_id: str, token: str, chat_id_str: str) -> None:
+        """Answer a ``deliver_<token>`` guest message with the cached media it names.
+
+        Callers reach here only after the authorization gate, so a token that leaks (it is
+        visible in the sender's own input box) still can't be redeemed by a stranger. Tokens
+        are single-use and short-lived; anything unknown or stale gets the error result
+        rather than a silent no-reply the caller can't distinguish from an outage.
+        """
+        from tools.guest_mode_tool import resolve_token
+        record = resolve_token(token)
+        if not record:
+            await self._answer_guest_query(
+                guest_query_id,
+                InlineQueryResultArticle(
+                    id="expired", title="Something went wrong",
+                    input_message_content=InputTextMessageContent(
+                        "⚠️ Something went wrong — that delivery link was already used or has expired. "
+                        "Ask me again and I'll regenerate it."),
+                ),
+                log_label="delivery expired reply",
+            )
+            return
+        await self._answer_guest_query(
+            guest_query_id, self._guest_cached_media_result(record), log_label="delivery reply")
+        logger.info("[%s] Delivered guest attachment (chat=%s kind=%s)", self.name, chat_id_str, record.get("media_kind"))
+
     async def _handle_guest_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle guest_message updates (Bot API 10.0 guest bot feature).
 
@@ -6336,7 +6732,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         text = msg.text or getattr(msg, "caption", None) or ""
-        if not text.strip():
+        # A guest @mention can carry an attachment instead of (or alongside) text: a
+        # caption-less photo is still a real request, so presence of media counts as
+        # content the same way text does.
+        has_media = self._message_has_media(msg)
+        if not text.strip() and not has_media:
             return
 
         chat_id_str = str(msg.chat.id) if msg.chat else ""
@@ -6378,6 +6778,33 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # Attachment redemption: the caller tapped the button on an earlier reply, which
+        # pre-filled "deliver_<token>" in their input box. That arrives here as an ordinary
+        # guest message with a FRESH query id — the one chance to answer with the file. It
+        # never registers guest turn state and never reaches the LLM: the work is already
+        # done, this is only the handover. Sits behind the authorization gate above, so a
+        # token seen over someone's shoulder still can't be redeemed by a stranger.
+        _delivery_token = self._guest_delivery_token(text)
+        if _delivery_token:
+            await self._handle_guest_delivery_request(guest_query_id, _delivery_token, chat_id_str)
+            return
+
+        # Album continuation: Telegram delivers each photo of an album as its own guest
+        # message. The first one started the turn; the rest must merge into that event
+        # (the media-group debounce below does the merging) instead of being rejected as
+        # "busy" — one album is one request, not N.
+        _media_group_id = str(getattr(msg, "media_group_id", "") or "")
+        if (
+            has_media and _media_group_id
+            and self._guest_media_group_ids.get(chat_id_str) == _media_group_id
+            and chat_id_str in self._pending_guest_queries
+        ):
+            _album_event = self._build_message_event(
+                msg, self._media_message_type(msg), update_id=update.update_id)
+            _album_event.text = self._clean_bot_trigger_text(_album_event.text)
+            await self._cache_and_route_media(msg, _album_event)
+            return
+
         # Guest state (_pending_guest_queries, _guest_reply_buffer,
         # _guest_inline_message_ids) is keyed by chat_id, not guest_query_id —
         # a second @mention from the same chat while a turn is still in flight
@@ -6410,7 +6837,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # None = stub fired, Telegram returned no imi.  str = real imi.
         self._guest_inline_message_ids[chat_id_str] = False
 
-        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        if _media_group_id and has_media:
+            self._guest_media_group_ids[chat_id_str] = _media_group_id
+
+        event = self._build_message_event(
+            msg, self._media_message_type(msg) if has_media else MessageType.TEXT,
+            update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
 
         # Session isolation per guest caller falls out of _build_message_event for
@@ -6428,8 +6860,12 @@ class TelegramAdapter(BasePlatformAdapter):
             "a @mention in a group chat where the bot is not a member. "
             "Direct Bot API calls (sendVideo, sendPhoto, sendDocument, sendAudio, "
             "curl to api.telegram.org, etc.) to this chat will fail with "
-            "\"Forbidden: bot is not a member\" — do NOT attempt them. Media "
-            "delivery is not yet supported in this context; respond with text only."
+            "\"Forbidden: bot is not a member\" — do NOT attempt them.\n"
+            "Attachments DO work through the normal channel: write the file under "
+            f"`{self._guest_media_staging_hint()}` and attach it with a `MEDIA:<path>` "
+            "directive as usual. The gateway stages it and the reply carries a button "
+            "the asker taps to receive it in this chat. Files written anywhere else are "
+            "refused, so always stage under that directory."
         )
         if event.channel_prompt:
             event.channel_prompt = event.channel_prompt + "\n\n" + _guest_delivery_note
@@ -6453,6 +6889,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 ),
                 log_label="slash-block reply",
             )
+            return
+
+        if has_media:
+            # Downloading and caching an attachment (and running vision/STT over it) takes
+            # seconds, and the text path only fires the stub once send_typing lands. Fire it
+            # here so the caller sees the ⏳ straight away instead of silence.
+            await self._guest_fire_text_stub(chat_id_str)
+            await self._cache_and_route_media(msg, event)
             return
 
         event = self._apply_telegram_group_observe_attribution(event)
@@ -6789,6 +7233,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.caption:
             from plugins.platforms.telegram.telegram_context import group_trigger_text
             event.text = group_trigger_text(self, msg, expand_link_entities(msg))
+        await self._cache_and_route_media(msg, event)
+
+    async def _cache_and_route_media(self, msg, event: MessageEvent) -> None:
+        """Cache ``msg``'s attachment into ``event`` and dispatch it.
+
+        Shared by the member path above and the guest path (``_handle_guest_message_update``),
+        so an image or a file dropped into a guest chat gets the same vision/STT/document
+        treatment a DM gets — only the reply's last hop differs.
+        """
         # Stickers: _handle_sticker overwrites event.text with its vision description, so observe attribution must run after it.
         if msg.sticker:
             await self._handle_sticker(msg, event)
@@ -7139,7 +7592,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
         replaces, not adds); CANCELLED explicitly clears the 👀."""
-        # Guest mode OPC (Bot API 10.0): edit the stub with the final text reply.
+        # Guest mode OPC (Bot API 10.0): edit the stub with the final text reply, and
+        # offer whatever attachments the turn staged as deliver_<token> buttons.
+        self._ensure_guest_state()
         _gc_id = str(getattr(event.source, "chat_id", None) or "")
         if _gc_id:
             _guest_qid = self._pending_guest_queries.pop(_gc_id, None)
@@ -7150,6 +7605,15 @@ class TelegramAdapter(BasePlatformAdapter):
             _guest_imi_raw = self._guest_inline_message_ids.pop(_gc_id, False)
             _guest_imi = _guest_imi_raw if isinstance(_guest_imi_raw, str) else None
             _buffered = self._guest_reply_buffer.pop(_gc_id, "")
+            # Attachments staged during the turn (MEDIA: directives routed through
+            # _guest_media_send). A guest bot cannot push a file into a chat it hasn't
+            # joined, so the reply carries a button per file instead; tapping it sends
+            # deliver_<token> back and that query is answered with the cached media.
+            _guest_media_all = self._guest_turn_media_all.pop(_gc_id, None) or []
+            _guest_media_latest = self._guest_turn_media.pop(_gc_id, None)
+            if not _guest_media_all and _guest_media_latest:
+                _guest_media_all = [_guest_media_latest]
+            self._guest_media_group_ids.pop(_gc_id, None)
             self._guest_only_chats.discard(_gc_id)
             if (_guest_qid or _guest_imi) and self._bot:
                 _plain = _strip_mdv2(self.format_message(_buffered)).strip() if _buffered else ""
@@ -7161,12 +7625,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 # (e.g. 2,049 emoji is 2,049 chars but 4,098 UTF-16 units) and
                 # fail the editMessageText call below, after guest state has
                 # already been torn down above — silently dropping the turn.
-                _reply_text = self._truncate_stream_overflow_preview(_plain) or \
-                    "⚠️ Sorry, something went wrong. Please try again."
+                # Only the edit path needs buttons; the no-imi path below still holds an
+                # unspent query and answers with the file itself, so don't mint a token for it.
+                _guest_markup, _guest_hint = (
+                    self._guest_media_keyboard(_guest_media_all) if (_guest_imi and _guest_media_all)
+                    else (None, ""))
+                _reply_text = self._truncate_stream_overflow_preview(_plain) or (
+                    "" if _guest_markup is not None else "⚠️ Sorry, something went wrong. Please try again.")
+                if _guest_markup is not None:
+                    # Always spell out what the buttons are for: with no prose at all the
+                    # message would otherwise be a bare button with no explanation.
+                    _reply_text = self._truncate_stream_overflow_preview(
+                        f"{_reply_text}\n\n{_guest_hint}".strip())
                 logger.warning("[%s] guest OPC flush (chat=%s buffered_len=%d imi=%s)",
                                self.name, _gc_id, len(_buffered), _guest_imi)
                 try:
-                    if _guest_imi:
+                    if _guest_imi and _guest_markup is not None:
+                        # Attachment result: one edit, no typewriter — the buttons are the
+                        # point of the message and animating text under them just delays
+                        # the tap. reply_markup on an inline message needs no chat membership.
+                        await self._bot.edit_message_text(
+                            text=_reply_text, inline_message_id=_guest_imi, reply_markup=_guest_markup)
+                        logger.info(
+                            "[%s] guest OPC media edit (chat=%s imi=%s files=%d)",
+                            self.name, _gc_id, _guest_imi, len(_guest_media_all))
+                    elif _guest_imi:
                         # Text result: typewriter then final edit.  Animate over
                         # the already-truncated _reply_text, not raw _plain —
                         # otherwise a long _plain both risks an oversized
@@ -7192,6 +7675,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 _tw_pos += _tw_chunk
                         await self._bot.edit_message_text(text=_reply_text, inline_message_id=_guest_imi)
                         logger.warning("[%s] guest OPC text edit (chat=%s imi=%s)", self.name, _gc_id, _guest_imi)
+                    elif _guest_qid and _guest_media_all:
+                        # No imi, but the query was never spent: answer it with the file
+                        # itself — better than a button, since this is a live one-shot slot.
+                        _direct = dict(_guest_media_all[0])
+                        _direct["caption"] = (_plain or None) and _plain[:1024]
+                        await self._answer_guest_query(
+                            _guest_qid, self._guest_cached_media_result(_direct, result_id="reply"),
+                            log_label="OPC media reply")
+                        logger.info("[%s] guest OPC direct media reply (chat=%s no_imi)", self.name, _gc_id)
                     elif _guest_qid:
                         # No imi (the stub call itself raised) — fall back to a fresh answerGuestQuery.
                         _fallback = "⛔ Not authorized." if not _buffered else _reply_text
