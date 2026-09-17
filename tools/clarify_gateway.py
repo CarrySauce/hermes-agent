@@ -217,6 +217,28 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
     return TEXT_NO_PENDING  # lost a race with a button/callback resolution — no work left
 
 
+def would_accept_text_response(session_key: str, response: str) -> bool:
+    """Whether *response* would resolve this session's pending clarify — without resolving it.
+
+    For callers that must decide how to ROUTE a message before the gateway's text intercept
+    (``run_inbound._hm_clarify_reply``) ever sees it, and cannot recover if that intercept then
+    declines: the Telegram guest path, where a message routed as an ordinary turn has no reply
+    surface of its own. Mirrors the intercept's accept path exactly — same lookup, same
+    ``include_choice_prompts=True``, same coercion — plus its two fall-through rules: empty text
+    and slash commands are NOT answers, they are a command the user wants dispatched normally.
+
+    Deliberately conservative: a False here costs the caller a "still working" reply, while a
+    wrong True costs a message that vanishes.
+    """
+    text = str(response or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    entry = get_pending_for_session(session_key, include_choice_prompts=True)
+    if entry is None:
+        return False
+    return _coerce_text_response_detailed(entry, text)[0] is not None
+
+
 def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     """True only when the typed reply was accepted and the waiter unblocked."""
     return attempt_text_response_for_session(session_key, response) == TEXT_RESOLVED

@@ -1176,6 +1176,13 @@ gateway restart, say) is refused rather than evaluated without context. If there
 to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
 answer to a question nobody could see.
 
+**Typed answers.** Tapping `✏️ Other`, or answering an open-ended question, means typing into the
+chat while the turn is still running. That message is recognised as the answer the turn is waiting
+for and routed into it, so the turn resumes; the bot acknowledges it and keeps writing its reply to
+the original message. Anything the prompt would not accept as an answer — a slash command, an
+attachment, an unrelated question while the buttons are still up — gets the usual "still working on
+a previous request" reply instead, so nothing is silently swallowed.
+
 Slash commands are not routed in guest chats — each command would consume a second reply slot —
 so the bot answers those with a short note instead.
 

@@ -1241,3 +1241,200 @@ async def test_guest_picker_tap_reaches_its_handler():
 
     handler.assert_awaited_once()
     assert handler.await_args.args[2] == "42"
+
+
+# ---------------------------------------------------------------------------
+# Typed clarify answers ("✏️ Other", and open-ended prompts)
+#
+# The turn is blocked in wait_for_response holding _pending_guest_queries[chat],
+# and the busy guard rejected inbound messages BECAUSE it holds it: the answer the
+# turn was waiting for could never reach it. A continuation is not a new request.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clarify_session(monkeypatch):
+    """A guest turn in flight with a pending clarify registered under its session key."""
+    import tools.clarify_gateway as clarify_gateway
+
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    adapter._guest_chat_types["42"] = "supergroup"
+
+    session_key = "agent:main:telegram:42:999"
+    monkeypatch.setattr(adapter, "_gateway_session_key", lambda event: session_key)
+    for cid in list(clarify_gateway._entries):
+        clarify_gateway._entries.pop(cid, None)
+    clarify_gateway._session_index.clear()
+    yield adapter, clarify_gateway, session_key
+    clarify_gateway.clear_session(session_key)
+    clarify_gateway._entries.clear()
+    clarify_gateway._session_index.clear()
+
+
+async def _deliver_guest_text(adapter, text, *, update_id, gqid):
+    update, _msg = _make_guest_update(update_id=update_id, gqid=gqid, text=text)
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_apply_telegram_group_observe_attribution", side_effect=lambda e: e), \
+         patch.object(adapter, "_enqueue_text_event") as enqueued:
+        await adapter._handle_guest_message_update(update, MagicMock())
+    return enqueued
+
+
+@pytest.mark.asyncio
+async def test_typed_answer_after_other_reaches_the_in_flight_turn(clarify_session):
+    """The ✏️ Other path: the answer is routed into the waiting turn, not answered "busy"."""
+    adapter, clarify_gateway, session_key = clarify_session
+    entry = clarify_gateway.register("c1", session_key, "Which day?", ["Mon", "Tue"])
+    clarify_gateway.mark_awaiting_text(entry.clarify_id)
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot next Friday", update_id=51, gqid="gq_answer")
+
+    enqueued.assert_called_once()
+    assert enqueued.call_args.args[0].text == "next Friday"
+    # The caller's own message is acknowledged, and it is NOT the busy reply.
+    answered = adapter._bot.answer_guest_query.await_args.args[1]
+    assert answered.id == "clarify-ack"
+    # The turn keeps the surface it has been writing to all along.
+    assert adapter._pending_guest_queries["42"] == "gqid_test"
+    assert adapter._guest_inline_message_ids["42"] == "imi_abc"
+
+
+@pytest.mark.asyncio
+async def test_open_ended_clarify_answer_reaches_the_turn(clarify_session):
+    """An open-ended clarify registers awaiting_text=True and has no button to fall back on."""
+    adapter, clarify_gateway, session_key = clarify_session
+    clarify_gateway.register("c2", session_key, "What should I call it?", None)
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=52, gqid="gq_open")
+
+    enqueued.assert_called_once()
+    assert enqueued.call_args.args[0].text == "call it Atlas"
+
+
+@pytest.mark.asyncio
+async def test_numeric_pick_typed_at_an_open_choice_prompt_is_a_continuation(clarify_session):
+    """Typing "2" at a prompt whose buttons are still showing resolves it, per the intercept."""
+    adapter, clarify_gateway, session_key = clarify_session
+    clarify_gateway.register("c3", session_key, "Which day?", ["Mon", "Tue"])
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot 2", update_id=53, gqid="gq_pick")
+
+    enqueued.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_second_unrelated_request_during_a_clarify_still_gets_the_busy_reply(clarify_session):
+    """Regression guard for the guard: prose the clarify would decline is not a continuation."""
+    adapter, clarify_gateway, session_key = clarify_session
+    # Choices, not awaiting_text: unmatched prose is TEXT_REJECTED_PROSE, which the gateway
+    # intercept declines — routing it here would leave it with no surface for its own reply.
+    clarify_gateway.register("c4", session_key, "Which day?", ["Mon", "Tue"])
+
+    enqueued = await _deliver_guest_text(
+        adapter, "@testbot what's the weather in Lisbon?", update_id=54, gqid="gq_other")
+
+    enqueued.assert_not_called()
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+
+
+@pytest.mark.asyncio
+async def test_slash_command_at_a_clarify_is_not_swallowed_as_an_answer(clarify_session):
+    """The intercept lets slash commands fall through, so they must not bypass the guard."""
+    adapter, clarify_gateway, session_key = clarify_session
+    entry = clarify_gateway.register("c5", session_key, "Which day?", None)
+    assert entry.awaiting_text is True  # would otherwise accept any text
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot /status", update_id=55, gqid="gq_slash")
+
+    enqueued.assert_not_called()
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+    assert clarify_gateway.has_pending(session_key) is True
+
+
+@pytest.mark.asyncio
+async def test_second_request_without_any_pending_clarify_still_gets_the_busy_reply(clarify_session):
+    """Nothing pending: the busy guard keeps protecting the in-flight turn's state."""
+    adapter, _clarify_gateway, _session_key = clarify_session
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot and another thing", update_id=56, gqid="gq_new")
+
+    enqueued.assert_not_called()
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+
+
+@pytest.mark.asyncio
+async def test_answer_from_another_caller_does_not_reach_the_clarify(clarify_session, monkeypatch):
+    """Per-caller session keys: someone else's text is not the answer this turn is waiting for."""
+    adapter, clarify_gateway, session_key = clarify_session
+    clarify_gateway.register("c6", session_key, "Which day?", None)
+    # The other caller's own session key — which has no pending clarify.
+    monkeypatch.setattr(adapter, "_gateway_session_key", lambda event: "agent:main:telegram:42:1234")
+
+    enqueued = await _deliver_guest_text(adapter, "@testbot Tuesday", update_id=57, gqid="gq_stranger")
+
+    enqueued.assert_not_called()
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+    assert clarify_gateway.has_pending(session_key) is True
+
+
+@pytest.mark.asyncio
+async def test_guest_session_key_matches_the_key_the_clarify_is_registered_under():
+    """Pins the §6.2 assumption: the branch derives the key the gateway routes under."""
+    adapter = _make_adapter()
+    runner = MagicMock()
+    runner._session_key_for_source = MagicMock(return_value="agent:main:telegram:42:999")
+    adapter._message_handler = MagicMock(__self__=runner)
+
+    event = MagicMock()
+    event.source = MagicMock(chat_id="42", user_id="999")
+
+    assert adapter._gateway_session_key(event) == "agent:main:telegram:42:999"
+    runner._session_key_for_source.assert_called_once_with(event.source)
+
+
+@pytest.mark.asyncio
+async def test_attachment_during_a_clarify_is_not_treated_as_a_typed_answer(clarify_session):
+    """A file is not an answer, and routing it as TEXT would drop it — busy reply instead."""
+    adapter, clarify_gateway, session_key = clarify_session
+    clarify_gateway.register("c7", session_key, "Which day?", None)
+    update, _msg = _make_guest_media_update(kind="photo", caption="@testbot Tuesday", gqid="gq_media")
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_cache_and_route_media", new=AsyncMock()) as routed:
+        await adapter._handle_guest_message_update(update, MagicMock())
+
+    routed.assert_not_called()
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+
+
+# ---------------------------------------------------------------------------
+# Sends to a guest-only chat between turns
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_between_turns_to_a_guest_only_chat_is_refused_not_attempted():
+    """Advisory traffic after the turn ends used to spend a request on a certain Forbidden."""
+    adapter = _make_adapter()
+    adapter._known_guest_chats["42"] = 0.0
+    adapter._bot.send_message = AsyncMock()
+
+    result = await adapter.send("42", "⏳ Another process is using this session.")
+
+    assert result.success is False
+    assert result.error == "guest_chat_no_surface"
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_real_member_message_clears_the_guest_only_marking():
+    """The bot was added to the group: stop refusing sends there."""
+    adapter = _make_adapter()
+    adapter._known_guest_chats["42"] = 0.0
+    update = MagicMock()
+    update.message = MagicMock(chat=MagicMock(id=42))
+
+    adapter._note_member_chat(update)
+
+    assert "42" not in adapter._known_guest_chats

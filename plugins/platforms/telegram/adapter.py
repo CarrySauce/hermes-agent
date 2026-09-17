@@ -563,6 +563,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # inline_message_id → rendered prompt text, standing in for ``query.message.text`` when a
         # handler echoes the question back into its edit.
         self._guest_prompt_texts: Dict[str, str] = {}
+        # Chats only ever reached as a guest. Outlives the turn so an advisory send that lands
+        # between turns is refused cleanly instead of spending a request on a certain "Forbidden".
+        self._known_guest_chats: Dict[str, float] = {}
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -3658,6 +3661,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     # with what we already have → append.
                     self._guest_reply_buffer[_cid_str] = _existing + _clean
                 return SendResult(success=True, message_id=None)
+            if _cid_str in self._known_guest_chats:
+                # A chat we have only ever reached as a guest, with no turn in flight to carry a
+                # reply: sendMessage here is answered with "Forbidden: bot is not a member", every
+                # time. Advisory traffic that lands between turns (busy-session notices, a late
+                # follow-up) used to spend a request and an ERROR line on that. Cleared the moment
+                # a real member message arrives, so a bot later added to the group is not stuck.
+                logger.info(
+                    "[%s] Skipping send to guest-only chat %s: no turn in flight, so no surface",
+                    self.name, _cid_str)
+                return SendResult(success=False, error="guest_chat_no_surface", retryable=False)
 
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
@@ -5674,6 +5687,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_inline_message_ids", dict), ("_guest_turn_media", dict), ("_guest_turn_media_all", dict),
         ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
         ("_guest_chat_types", dict), ("_guest_inline_chats", dict), ("_guest_prompt_texts", dict),
+        ("_known_guest_chats", dict),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -6368,6 +6382,24 @@ class TelegramAdapter(BasePlatformAdapter):
         """Message-like payload for normal messages and channel posts (``update.channel_post``)."""
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _note_member_chat(self, update: Update) -> None:
+        """Forget a chat's guest-only marking once a real member message arrives from it.
+
+        ``update.message`` is populated only for a chat the bot is actually in (a guest update
+        carries ``guest_message`` instead), so this is the signal that the bot was added to a group
+        it used to answer as a guest. Without it the no-surface shortcut in ``send()`` would keep
+        refusing sends there for the life of the process.
+        """
+        message = getattr(update, "message", None)
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not chat_id:
+            return
+        self._ensure_guest_state()  # runs on the ordinary inbound path; adapters built without __init__
+        if self._known_guest_chats.pop(chat_id, None) is not None:
+            logger.info(
+                "[%s] Chat %s now delivers member messages; clearing its guest-only marking",
+                self.name, chat_id)
+
     def _log_blocked_user(self, msg, *, level=logging.WARNING, what: str = "unauthorized user") -> None:
         logger.log(
             level, "[Telegram] Blocked %s %s in chat %s", what, getattr(getattr(msg, "from_user", None), "id", None),
@@ -6938,6 +6970,53 @@ class TelegramAdapter(BasePlatformAdapter):
             guest_query_id, self._guest_cached_media_result(record), log_label="delivery reply")
         logger.info("[%s] Delivered guest attachment (chat=%s kind=%s)", self.name, chat_id_str, record.get("media_kind"))
 
+    def _gateway_session_key(self, event: MessageEvent) -> Optional[str]:
+        """The session key the gateway will route *event* under, or None if it can't be derived.
+
+        Prefers the runner's own resolver so the key is byte-identical to the one the clarify
+        intercept looks up (it honours the session store and any profile namespace); falls back to
+        the adapter-side derivation ``_photo_batch_key`` already uses when no runner is reachable
+        (a bare adapter, a multiplexed handler closure, tests).
+        """
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        resolver = getattr(runner, "_session_key_for_source", None)
+        if callable(resolver):
+            try:
+                key = resolver(event.source)
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:
+                logger.debug("[%s] runner session-key resolution failed", self.name, exc_info=True)
+        try:
+            from gateway.session import build_session_key
+            return build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                profile=self._session_key_profile(event.source))
+        except Exception:
+            logger.debug("[%s] session-key derivation failed", self.name, exc_info=True)
+            return None
+
+    def _is_guest_clarify_continuation(self, event: MessageEvent) -> bool:
+        """Whether *event* is the typed answer the in-flight guest turn is blocked waiting for.
+
+        Conservative on purpose (see ``clarify_gateway.would_accept_text_response``): only text the
+        intercept will actually accept bypasses the busy guard. Text it would decline — a slash
+        command, prose at a still-open choice prompt, a voice note whose transcript the adapter
+        cannot see yet — keeps the busy reply, because a message routed past the guard without
+        guest registration has no surface for its own reply and would vanish.
+        """
+        session_key = self._gateway_session_key(event)
+        if not session_key:
+            return False
+        try:
+            from tools.clarify_gateway import would_accept_text_response
+            return would_accept_text_response(session_key, event.text or "")
+        except Exception:
+            logger.debug("[%s] clarify-continuation check failed", self.name, exc_info=True)
+            return False
+
     async def _handle_guest_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle guest_message updates (Bot API 10.0 guest bot feature).
 
@@ -7049,6 +7128,38 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._cache_and_route_media(msg, _album_event)
             return
 
+        # Clarify continuation: the in-flight turn is blocked in wait_for_response waiting for
+        # exactly this text, and it holds _pending_guest_queries[chat_id] BECAUSE it is waiting.
+        # The busy guard below would therefore reject the answer the turn is waiting for — a
+        # deadlock, not a race: it fails every time, and it makes the "✏️ Other" button and every
+        # open-ended clarify unanswerable in guest mode. Route the text into the running turn the
+        # way the album branch above routes an album's later photos, and register nothing: this is
+        # not a new request, and re-registering would overwrite the query id and reset the stub
+        # sentinel, orphaning the inline message that turn is still editing. Text only: an
+        # attachment is not a typed answer, and routing one through here as a TEXT event would
+        # quietly drop the file, so it takes the busy reply like any other second request.
+        if chat_id_str in self._pending_guest_queries and not has_media:
+            _continuation = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+            _continuation.text = self._clean_bot_trigger_text(_continuation.text)
+            if self._is_guest_clarify_continuation(_continuation):
+                # The fresh query id this message arrived with is answered on the spot: the turn
+                # keeps writing to the ORIGINAL inline message, so without this the caller's own
+                # message would sit there unanswered.
+                await self._answer_guest_query(
+                    guest_query_id,
+                    InlineQueryResultArticle(
+                        id="clarify-ack", title="Got it",
+                        input_message_content=InputTextMessageContent(
+                            "✅ Got it — continuing the reply above."),
+                    ),
+                    log_label="clarify-continuation ack",
+                )
+                logger.info(
+                    "[%s] Guest clarify continuation routed into the in-flight turn (chat=%s)",
+                    self.name, chat_id_str)
+                self._enqueue_text_event(self._apply_telegram_group_observe_attribution(_continuation))
+                return
+
         # Guest state (_pending_guest_queries, _guest_reply_buffer,
         # _guest_inline_message_ids) is keyed by chat_id, not guest_query_id —
         # a second @mention from the same chat while a turn is still in flight
@@ -7074,6 +7185,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Remembered for button taps: an inline-message callback carries no chat, and the tap must
         # be authorized against the same (user, chat, chat_type) tuple this message was gated on.
         self._guest_chat_types[chat_id_str] = str(_guest_chat_type or "group")
+        self._known_guest_chats[chat_id_str] = time.time()
+        while len(self._known_guest_chats) > self._GUEST_INLINE_MAP_MAX:
+            self._known_guest_chats.pop(next(iter(self._known_guest_chats)), None)
 
         if not self._should_process_message(msg):
             self._pending_guest_queries.pop(chat_id_str, None)
@@ -7151,6 +7265,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
+        self._note_member_chat(update)
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7165,6 +7280,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        self._note_member_chat(update)
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7462,6 +7578,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        self._note_member_chat(update)
         msg = update.message
         if not msg:
             return
