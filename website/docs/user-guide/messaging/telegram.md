@@ -1167,6 +1167,15 @@ The button pre-fills `@yourbot deliver_<token>` in the asker's input box; sendin
 fetches the file. Enabling inline mode for the bot (BotFather → `/setinline`) makes that a single
 tap, and the same payload is then answered as an inline result too.
 
+**Prompts that need an answer.** A clarify question, an exec approval or a `/model`-style picker
+cannot be posted as a new message either, so it is drawn on that same inline message — text and
+inline keyboard together — and tapping a button edits it in place: first to the outcome of the tap,
+then to the final reply when the turn finishes. Taps are authorized against the same allowlist as
+the @mention that started the turn, and a tap that can no longer be traced back to its chat (after a
+gateway restart, say) is refused rather than evaluated without context. If there is no inline message
+to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
+answer to a question nobody could see.
+
 Slash commands are not routed in guest chats — each command would consume a second reply slot —
 so the bot answers those with a short note instead.
 

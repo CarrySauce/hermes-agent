@@ -70,6 +70,9 @@ class _FakeInlineQueryResultArticle:
         self.id = id
         self.title = title
         self.input_message_content = input_message_content
+        # Kept so the control-prompt tests can assert the keyboard rides along with the
+        # one-shot answer (real InlineQueryResultArticle takes reply_markup the same way).
+        self.reply_markup = _kw.get("reply_markup")
 
 
 class _FakeInlineQueryResultCachedVideo:
@@ -1052,3 +1055,189 @@ async def test_oversized_photo_staging_falls_back_to_document(tmp_path, monkeypa
     assert result.success is True
     assert adapter._guest_turn_media["42"]["file_id"] == "fid_as_doc"
     assert adapter._guest_turn_media["42"]["media_kind"] == "document"
+
+
+# ---------------------------------------------------------------------------
+# Control prompts (clarify / approval / pickers) in a guest chat
+#
+# Every one of them funnels through _send_prompt → _send_control_message →
+# sendMessage, which a guest chat rejects with "Forbidden: bot is not a member".
+# The turn then hung on a prompt that never rendered. A guest prompt is an edit of
+# the inline message already on screen.
+# ---------------------------------------------------------------------------
+
+def _clarify_kwargs(**over):
+    kwargs = dict(chat_id="42", question="Confirm the reminder?", choices=["Yes", "No"],
+                  clarify_id="c1", session_key="s1")
+    kwargs.update(over)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_guest_clarify_edits_stub_instead_of_sending():
+    """The prompt and its buttons land by editing the stub — no sendMessage at all."""
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    adapter._bot.send_message = AsyncMock()
+
+    result = await adapter.send_clarify(**_clarify_kwargs())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_called()
+    call = adapter._bot.edit_message_text.await_args
+    assert call.kwargs["inline_message_id"] == "imi_abc"
+    assert call.kwargs["reply_markup"] is not None
+    assert "Confirm the reminder?" in call.kwargs["text"]
+    # on_sent still runs, so the tap can be resolved against the session.
+    assert adapter._clarify_state["c1"] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_guest_prompt_without_a_stub_spends_the_query_on_itself():
+    """Nothing drawn yet: answer the one-shot query with the prompt rather than a stub."""
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)  # leaves the sentinel at False = stub not fired
+    adapter._bot.answer_guest_query = AsyncMock(return_value=MagicMock(inline_message_id="imi_new"))
+
+    result = await adapter.send_clarify(**_clarify_kwargs())
+
+    assert result.success is True
+    adapter._bot.edit_message_text.assert_not_called()
+    answered = adapter._bot.answer_guest_query.await_args.args[1]
+    assert "Confirm the reminder?" in answered.input_message_content.message_text
+    assert answered.reply_markup is not None
+    # Later edits (the tap, then OPC's final reply) target that same message.
+    assert adapter._guest_inline_message_ids["42"] == "imi_new"
+
+
+@pytest.mark.asyncio
+async def test_guest_prompt_without_any_surface_fails_definitively():
+    """No inline message and no usable query: say so, so the caller doesn't wait forever."""
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    adapter._guest_inline_message_ids["42"] = None  # stub fired, Telegram returned no imi
+    adapter._bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("query expired"))
+
+    result = await adapter.send_clarify(**_clarify_kwargs())
+
+    assert result.success is False
+    assert result.error == "guest_no_inline_message"
+    # The dead query id is dropped, so the gateway's plain-text fallback fails too instead of
+    # buffering into a void and reporting the prompt delivered.
+    assert "42" not in adapter._pending_guest_queries
+    fallback = await adapter.send("42", "❓ Confirm the reminder?")
+    assert fallback.success is False
+    assert fallback.error == "guest_no_inline_message"
+
+
+@pytest.mark.asyncio
+async def test_guest_exec_approval_prompt_also_edits_the_stub():
+    """The fix sits in the shared prompt shell, so the whole family is covered."""
+    from gateway.platforms.base import ExecApprovalPrompt
+
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    adapter._bot.send_message = AsyncMock()
+    prompt = ExecApprovalPrompt(
+        chat_id="42", session_key="s1", text="⚠️ Run <pre>rm -rf /tmp/x</pre>?",
+        actions=[("✅ Allow Once", "once", "primary"), ("❌ Deny", "deny", "danger")],
+        command="rm -rf /tmp/x", description="cleanup", smart_denied=False, metadata=None)
+
+    result = await adapter._send_exec_approval_prompt(prompt)
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_called()
+    assert adapter._bot.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_non_guest_control_prompt_is_unchanged():
+    """Regression guard: an ordinary chat still gets a plain sendMessage."""
+    adapter = _make_adapter()
+    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=7))
+
+    result = await adapter.send_clarify(**_clarify_kwargs(chat_id="999"))
+
+    assert result.success is True and result.message_id == "7"
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._bot.edit_message_text.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Button taps on an inline message (query.message is None)
+# ---------------------------------------------------------------------------
+
+def _inline_query_tap(adapter, *, imi="imi_abc", data="cl:c1:other", user_id=999):
+    query = MagicMock()
+    query.message = None
+    query.inline_message_id = imi
+    query.data = data
+    query.from_user = MagicMock(id=user_id, first_name="Asker", username="asker")
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    return query
+
+
+@pytest.mark.asyncio
+async def test_guest_callback_ctx_recovers_the_chat_from_the_inline_message():
+    """A tap carries no chat; the mapping recorded when the prompt was drawn supplies it."""
+    adapter = _make_adapter()
+    adapter._guest_chat_types["42"] = "supergroup"
+    adapter._remember_guest_inline_message("42", "imi_abc", prompt_text="❓ Confirm?")
+
+    ctx = adapter._callback_ctx(_inline_query_tap(adapter))
+
+    assert ctx["chat_id"] == "42"
+    assert ctx["chat_type"] == "supergroup"
+    assert ctx["thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_unattributable_inline_tap_is_refused_fail_closed():
+    """No mapping → no auth context → refuse, rather than evaluate it as a DM."""
+    adapter = _make_adapter()
+    query = _inline_query_tap(adapter, imi="imi_unknown")
+
+    with patch.object(adapter, "_handle_clarify_callback", new=AsyncMock()) as handler:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    handler.assert_not_called()
+    query.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guest_clarify_other_branch_does_not_raise_without_message():
+    """The ✏️ Other branch used to dereference query.message.text and blow up on every guest tap."""
+    import tools.clarify_gateway as clarify_gateway
+
+    adapter = _make_adapter()
+    adapter._guest_chat_types["42"] = "supergroup"
+    adapter._remember_guest_inline_message("42", "imi_abc", prompt_text="❓ Confirm the reminder?")
+    adapter._clarify_state["c1"] = "s1"
+    query = _inline_query_tap(adapter)
+
+    with patch.object(adapter, "_callback_authorized", new=AsyncMock(return_value=True)), \
+         patch.object(clarify_gateway, "mark_awaiting_text", return_value=True):
+        await adapter._handle_clarify_callback(query, "cl:c1:other", adapter._callback_ctx(query))
+
+    query.answer.assert_awaited()
+    edited = query.edit_message_text.await_args.kwargs["text"]
+    assert "Confirm the reminder?" in edited
+    assert "Awaiting typed response" in edited
+
+
+@pytest.mark.asyncio
+async def test_guest_picker_tap_reaches_its_handler():
+    """The picker dispatch read the chat off query.message, so guest taps did nothing at all."""
+    adapter = _make_adapter()
+    adapter._guest_chat_types["42"] = "supergroup"
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    query = _inline_query_tap(adapter, data="cp:0")
+
+    with patch.object(adapter, "_handle_choice_picker_callback", new=AsyncMock()) as handler:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    handler.assert_awaited_once()
+    assert handler.await_args.args[2] == "42"

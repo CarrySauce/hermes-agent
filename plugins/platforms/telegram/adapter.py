@@ -169,6 +169,21 @@ from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from utils import env_float, env_int
 
+class _GuestInlinePrompt:
+    """What a control prompt "sent" into a guest chat: an inline message, so no ``message_id``.
+
+    ``_send_prompt``'s ``on_sent`` hooks take the returned Message to remember where the prompt
+    landed. An inline message has an ``inline_message_id`` instead (tracked separately, keyed by
+    chat), so this carries the chat and an explicit ``None`` rather than a fabricated id.
+    """
+
+    __slots__ = ("chat_id",)
+    message_id = None
+
+    def __init__(self, chat_id: str) -> None:
+        self.chat_id = chat_id
+
+
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
@@ -539,6 +554,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # chat_id → media_group_id of the album the in-flight guest turn is collecting, so the
         # album's 2nd..Nth guest messages merge into that turn instead of hitting the busy reply.
         self._guest_media_group_ids: Dict[str, str] = {}
+        # chat_id → Telegram chat type of the guest chat, so a button tap (which carries no
+        # ``message``, hence no chat) is authorized against the same tuple the inbound message was.
+        self._guest_chat_types: Dict[str, str] = {}
+        # inline_message_id → {"chat_id", "chat_type"}: the reverse map a callback on an inline
+        # message needs. Outlives the turn (a tap can land late) and is bounded, not per-turn state.
+        self._guest_inline_chats: Dict[str, Dict[str, Any]] = {}
+        # inline_message_id → rendered prompt text, standing in for ``query.message.text`` when a
+        # handler echoes the question back into its edit.
+        self._guest_prompt_texts: Dict[str, str] = {}
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -3575,6 +3599,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     # feedback — no content classification, the stub always fires.
                     if self._guest_inline_message_ids.get(_cid_str) is False:
                         await self._guest_fire_text_stub(_cid_str)
+                    if not self._guest_has_delivery_surface(_cid_str):
+                        # Neither an inline message to edit nor an unspent query: this text can
+                        # never reach the chat. Reporting success here is what let an
+                        # undeliverable clarify prompt read as delivered — the gateway's
+                        # plain-text fallback takes a successful send as proof it arrived and
+                        # then waits for an answer to a question nobody ever saw.
+                        return SendResult(success=False, error="guest_no_inline_message")
                     return SendResult(success=True, message_id=None)
 
                 # Streaming: fire the stub now if it hasn't fired yet (covers responses
@@ -4090,6 +4121,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(built, SendResult):
                 return built
             text, keyboard, on_sent = built
+            # Guest chats have no sendMessage: the bot is not a member, so the control path below
+            # dies with "Forbidden" and the caller waits on a prompt that never rendered. The one
+            # surface a guest bot owns is the inline message its query was answered with.
+            if self._is_guest_chat(chat_id):
+                return await self._send_guest_prompt(
+                    what, chat_id, text, keyboard, on_sent,
+                    parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2)
             msg = await self._send_control_message(
                 chat_id, text, parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
@@ -4241,8 +4279,10 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await query.edit_message_text(text=self.format_message(result_text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
         except Exception:
-            with contextlib.suppress(Exception):
+            try:
                 await query.edit_message_text(text=result_text, parse_mode=None, reply_markup=None)
+            except Exception as exc:
+                self._log_callback_edit_failure(query, exc)
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
@@ -4495,18 +4535,41 @@ class TelegramAdapter(BasePlatformAdapter):
         with contextlib.suppress(Exception):
             await query.answer(text="⚠️ This prompt expired — please /retry.")
         await self._edit_html_quiet(
-            query, f"❓ {_html.escape(query.message.text or '')}\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>")
+            query,
+            f"❓ {_html.escape(self._callback_prompt_text(query))}"
+            "\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>")
 
-    @staticmethod
-    async def _edit_html_quiet(query, text: str) -> None:
-        """HTML edit with the keyboard removed; failures ignored (non-fatal)."""
-        with contextlib.suppress(Exception):
+    def _log_callback_edit_failure(self, query, exc: Exception) -> None:
+        """Log a post-tap edit that failed: debug for an ordinary message, warning for an inline one.
+
+        On the guest route this edit is the only thing that makes the tap visible, so swallowing
+        its failure leaves a prompt that looks frozen and a log that says nothing.
+        """
+        if getattr(query, "message", None) is None:
+            logger.warning(
+                "[%s] inline-message callback edit failed (imi=%s): %s", self.name,
+                getattr(query, "inline_message_id", None), _redact_telegram_error_text(exc))
+        else:
+            logger.debug("[%s] callback edit failed: %s", self.name, _redact_telegram_error_text(exc))
+
+    async def _edit_html_quiet(self, query, text: str) -> None:
+        """HTML edit with the keyboard removed; failures are non-fatal but never silent.
+
+        PTB targets ``inline_message_id`` automatically when ``query.message`` is None, so this
+        works unchanged for a guest prompt.
+        """
+        try:
             await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as exc:
+            self._log_callback_edit_failure(query, exc)
 
     async def _edit_md_quiet(self, query, text_md: str) -> None:
-        """MarkdownV2 edit with the keyboard removed; failures ignored (non-fatal)."""
-        with contextlib.suppress(Exception):
-            await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+        """MarkdownV2 edit with the keyboard removed; failures are non-fatal but never silent."""
+        try:
+            await query.edit_message_text(
+                text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+        except Exception as exc:
+            self._log_callback_edit_failure(query, exc)
 
     async def _handle_inline_query(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Answer ``@botname <query>`` with a searchable command/skill picker (the ``/`` menu is capped at
@@ -4565,14 +4628,35 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] inline picker answer failed", self.name, exc_info=True)
 
-    @staticmethod
-    def _callback_ctx(query) -> Dict[str, Any]:
-        """Chat/thread/user context of a button tap, for the callback auth gate."""
+    def _callback_ctx(self, query) -> Dict[str, Any]:
+        """Chat/thread/user context of a button tap, for the callback auth gate.
+
+        A tap on an INLINE message — every guest-chat prompt — has ``message`` set to None and
+        carries ``inline_message_id`` instead, so the chat is recovered from the mapping the
+        prompt recorded. That keeps the tap gated on the same (user, chat, chat_type) tuple the
+        inbound guest message was gated on. When the mapping is gone the context stays all-None
+        and the dispatcher refuses the tap, rather than letting it be evaluated as a DM.
+        """
         query_message = getattr(query, "message", None)
+        if query_message is None:
+            guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
+            return {
+                "chat_id": (guest or {}).get("chat_id"), "chat_type": (guest or {}).get("chat_type"),
+                "thread_id": None, "user_name": getattr(getattr(query, "from_user", None), "first_name", None)}
         query_chat = getattr(query_message, "chat", None)
         return {
             "chat_id": getattr(query_message, "chat_id", None), "chat_type": getattr(query_chat, "type", None),
             "thread_id": getattr(query_message, "message_thread_id", None), "user_name": getattr(query.from_user, "first_name", None)}
+
+    def _callback_prompt_text(self, query) -> str:
+        """Text of the message a tap came from — ``query.message.text``, or, for an inline
+        message (guest mode, where ``message`` is None), the prompt text recorded when it was
+        drawn. Empty string when neither exists; every caller only echoes it back into an edit."""
+        query_message = getattr(query, "message", None)
+        if query_message is not None:
+            return getattr(query_message, "text", None) or ""
+        inline_message_id = getattr(query, "inline_message_id", None)
+        return (self._guest_prompt_texts.get(str(inline_message_id)) or "") if inline_message_id else ""
 
     async def _callback_authorized(self, query, cb: Dict[str, Any], denial_text: str) -> bool:
         """Gate a button tap on the callback allowlist; answers ``denial_text`` when refused."""
@@ -4591,12 +4675,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         data = query.data
         cb = self._callback_ctx(query)
+        if getattr(query, "message", None) is None and cb["chat_id"] is None:
+            # A tap on an inline message we cannot attribute to a chat (gateway restart, or the
+            # bounded mapping aged out): there is no context to authorize against, so refuse.
+            # Falling through would hand the gate a chat-less, DM-shaped source.
+            logger.warning(
+                "[%s] callback on an unattributable inline message (imi=%s); refusing",
+                self.name, getattr(query, "inline_message_id", None))
+            with contextlib.suppress(Exception):
+                await query.answer(text="⚠️ This prompt expired — please ask again.")
+            return
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
             (("cp:",), self._handle_choice_picker_callback)):
             if data.startswith(prefixes):
-                chat_id = str(query.message.chat_id) if query.message else None
+                # cb["chat_id"], not query.message: an inline-message tap has no message, and
+                # reading it off one silently did nothing at all for every guest picker.
+                chat_id = str(cb["chat_id"]) if cb["chat_id"] is not None else None
                 if chat_id:
                     await handler(query, data, chat_id)
                 return
@@ -4683,7 +4779,11 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             from tools import slash_confirm as _slash_confirm_mod
             result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
-            if result_text and query.message:
+            if result_text and query.message is None:
+                # Inline prompt (guest chat): there is no chat to post a follow-up into — the
+                # message we just edited is the whole surface, so the result goes on it.
+                await self._edit_md_quiet(query, f"{label} by {user_display}\n\n{result_text}")
+            elif result_text and query.message:
                 # Inherit the prompt's topic: forums use message_thread_id; private DM-topic lanes need
                 # both the topic id and the prompt reply anchor.
                 thread_id = getattr(query.message, "message_thread_id", None)
@@ -4737,7 +4837,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             await query.answer(text="✏️ Type your answer in the chat.")
             await self._edit_html_quiet(
-                query, f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>")
+                query,
+                f"❓ {self._callback_prompt_text(query)}"
+                f"\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>")
             return
         # Numeric choice → resolve immediately with the chosen text
         try:
@@ -4766,7 +4868,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if resolved:
             await query.answer(text=f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
-                query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
+                query,
+                f"❓ {_html.escape(self._callback_prompt_text(query))}"
+                f"\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
         else:
             # Entry evicted / gateway restarted between ask and tap.
@@ -4849,7 +4953,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await query.answer(text=label)
         if not success:
             return
-        original_text = (query.message.text or "") if query.message else ""
+        original_text = self._callback_prompt_text(query)
         appended = f"{original_text}\n— {label} by {getattr(query.from_user, 'first_name', 'User')}"
         # Sticky state verbs keep the keyboard so further actions can stack; one-shots strip it (can't fire twice).
         with contextlib.suppress(Exception):
@@ -5569,6 +5673,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_pending_guest_queries", dict), ("_guest_only_chats", set), ("_guest_reply_buffer", dict),
         ("_guest_inline_message_ids", dict), ("_guest_turn_media", dict), ("_guest_turn_media_all", dict),
         ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
+        ("_guest_chat_types", dict), ("_guest_inline_chats", dict), ("_guest_prompt_texts", dict),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -6321,7 +6426,10 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 # SentGuestMessage.inline_message_id is a required field — if the
                 # call succeeded at all, a real id is guaranteed present.
-                self._guest_inline_message_ids[_chat_id_str] = fut.result().inline_message_id
+                _stub_imi = fut.result().inline_message_id
+                self._guest_inline_message_ids[_chat_id_str] = _stub_imi
+                # A button tap on this message carries no chat; record the way back now.
+                self._remember_guest_inline_message(_chat_id_str, _stub_imi)
             except Exception as _e:
                 self._guest_inline_message_ids[_chat_id_str] = None
                 logger.warning(
@@ -6668,6 +6776,142 @@ class TelegramAdapter(BasePlatformAdapter):
                 return match.group(1)
         return None
 
+    # -- Guest-mode control prompts (clarify / approval / pickers) ------------
+    #
+    # Every control prompt funnels through _send_prompt → _send_control_message →
+    # sendMessage, which a guest chat rejects: the bot is not a member. The turn then
+    # hung on a prompt nobody could see. In a guest chat there is no "new message" —
+    # only the inline message already on screen — so a prompt is an EDIT of that
+    # message carrying the inline keyboard, exactly as the streaming path edits it.
+
+    _GUEST_INLINE_MAP_MAX = 256
+
+    def _remember_guest_inline_message(
+        self, chat_id: str, inline_message_id: str, *, prompt_text: Optional[str] = None,
+    ) -> None:
+        """Record inline_message_id → chat, and the prompt text drawn on it.
+
+        A button tap on an inline message carries no ``message``, so this is the only way back
+        to the chat the tap belongs to — both for the authorization gate and for handlers that
+        echo the question. Bounded and deliberately NOT torn down with the turn: a tap can land
+        long after ``on_processing_complete`` has cleared the per-turn state.
+        """
+        if not inline_message_id:
+            return
+        cid = str(chat_id)
+        key = str(inline_message_id)
+        self._guest_inline_chats[key] = {
+            "chat_id": cid, "chat_type": self._guest_chat_types.get(cid, "group")}
+        if prompt_text is not None:
+            self._guest_prompt_texts[key] = prompt_text
+        for store in (self._guest_inline_chats, self._guest_prompt_texts, self._guest_chat_types):
+            while len(store) > self._GUEST_INLINE_MAP_MAX:
+                store.pop(next(iter(store)), None)
+
+    def _guest_context_for_inline_message(self, inline_message_id: Any) -> Optional[Dict[str, Any]]:
+        """The chat context recorded for *inline_message_id*, or None when it is unknown."""
+        if not inline_message_id:
+            return None
+        return self._guest_inline_chats.get(str(inline_message_id))
+
+    def _guest_has_delivery_surface(self, chat_id: Any) -> bool:
+        """Whether anything at all can still put text in front of a guest chat.
+
+        Either an inline message to edit, or an unspent ``guest_query_id`` to answer. With
+        neither, a send is not "quietly dropped" — it is undeliverable, and saying so is what
+        keeps a caller from waiting on it.
+        """
+        cid = str(chat_id)
+        return isinstance(self._guest_inline_message_ids.get(cid), str) or bool(
+            self._pending_guest_queries.get(cid))
+
+    @staticmethod
+    def _guest_prompt_title(text: str) -> str:
+        """Short title for the one-shot answer card (the body carries the real text)."""
+        first_line = (text or "").strip().splitlines()[0] if (text or "").strip() else "Question"
+        return _strip_mdv2(first_line)[:60] or "Question"
+
+    async def _answer_guest_query_with_prompt(
+        self, chat_id: str, text: str, keyboard: Any, *, parse_mode: Any,
+    ) -> Optional[str]:
+        """Spend the one-shot guest query on the prompt itself; returns its inline_message_id.
+
+        Used only when there is no stub to edit — either none was ever fired, or firing it raised
+        (which leaves the slot unspent). Answering twice after a SUCCESSFUL stub would orphan it,
+        so callers must check the sentinel first.
+        """
+        cid = str(chat_id)
+        guest_qid = self._pending_guest_queries.get(cid)
+        if not guest_qid or not self._bot:
+            return None
+        content_kwargs = {"parse_mode": parse_mode} if parse_mode is not None else {}
+        result = InlineQueryResultArticle(
+            id="prompt", title=self._guest_prompt_title(text),
+            input_message_content=InputTextMessageContent(text, **content_kwargs),
+            reply_markup=keyboard,
+        )
+        try:
+            sent = await self._bot.answer_guest_query(guest_qid, result)
+        except Exception as exc:
+            logger.warning(
+                "[%s] guest prompt answerGuestQuery failed (chat=%s): %s",
+                self.name, cid, _redact_telegram_error_text(exc))
+            return None
+        return getattr(sent, "inline_message_id", None)
+
+    def _finish_guest_prompt(
+        self, chat_id: str, inline_message_id: str, text: str, on_sent, *, parse_mode: Any,
+    ) -> None:
+        """Bookkeeping after a guest prompt is on screen: retarget edits, record the tap context."""
+        cid = str(chat_id)
+        self._guest_inline_message_ids[cid] = inline_message_id
+        # Stored unescaped so a handler echoing it produces what the user is reading, matching
+        # what ``query.message.text`` would have given for an ordinary message.
+        stored = _html.unescape(text) if parse_mode == ParseMode.HTML else text
+        self._remember_guest_inline_message(cid, inline_message_id, prompt_text=stored)
+        if on_sent is not None:
+            # The prompt lives in an inline message, which has no message_id; state that instead
+            # of inventing one (nothing reads it, and a fake id would route later edits wrong).
+            on_sent(_GuestInlinePrompt(cid))
+
+    async def _send_guest_prompt(
+        self, what: str, chat_id: str, text: str, keyboard: Any, on_sent, *, parse_mode: Any,
+    ) -> SendResult:
+        """Render a control prompt in a guest chat by editing the inline message on screen."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        cid = str(chat_id)
+        imi = self._guest_inline_message_ids.get(cid)
+        if not isinstance(imi, str):
+            # False → nothing drawn yet (no typing, no tool progress before the prompt): spend the
+            # query on the prompt rather than on a stub we would edit a moment later.
+            # None  → the stub's own answerGuestQuery raised, which most likely left the slot
+            #         unspent; one retry costs nothing and is the difference between a visible
+            #         prompt and a dead turn.
+            imi = await self._answer_guest_query_with_prompt(cid, text, keyboard, parse_mode=parse_mode)
+            if not isinstance(imi, str):
+                # No surface, and none obtainable. Drop the unusable query id so the gateway's
+                # plain-text fallback fails too: a "delivered" prompt nobody can see is what
+                # turned this into a silent wait instead of an error the agent can act on.
+                self._pending_guest_queries.pop(cid, None)
+                logger.warning(
+                    "[%s] %s: no inline message to draw on in guest chat %s — prompt undeliverable",
+                    self.name, what, cid)
+                return SendResult(success=False, error="guest_no_inline_message")
+            self._finish_guest_prompt(cid, imi, text, on_sent, parse_mode=parse_mode)
+            return SendResult(success=True, message_id=None)
+        try:
+            await self._bot.edit_message_text(
+                text=text, inline_message_id=imi, parse_mode=parse_mode, reply_markup=keyboard)
+        except Exception as exc:
+            logger.warning(
+                "[%s] %s: guest inline edit failed (imi=%s): %s",
+                self.name, what, imi, _redact_telegram_error_text(exc))
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+        self._finish_guest_prompt(cid, imi, text, on_sent, parse_mode=parse_mode)
+        logger.info("[%s] %s drawn on the guest inline message (chat=%s)", self.name, what, cid)
+        return SendResult(success=True, message_id=None)
+
     async def _handle_guest_delivery_request(self, guest_query_id: str, token: str, chat_id_str: str) -> None:
         """Answer a ``deliver_<token>`` guest message with the cached media it names.
 
@@ -6827,6 +7071,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Register state, fire stub, route to skill layer.
         self._pending_guest_queries[chat_id_str] = guest_query_id
         self._guest_only_chats.add(chat_id_str)
+        # Remembered for button taps: an inline-message callback carries no chat, and the tap must
+        # be authorized against the same (user, chat, chat_type) tuple this message was gated on.
+        self._guest_chat_types[chat_id_str] = str(_guest_chat_type or "group")
 
         if not self._should_process_message(msg):
             self._pending_guest_queries.pop(chat_id_str, None)
