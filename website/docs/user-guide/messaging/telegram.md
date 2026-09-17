@@ -1163,6 +1163,10 @@ Delivery tokens behind the buttons are single-use, expire after 15 minutes, and 
 against the caller allowlist when redeemed, so a token read over someone's shoulder is useless
 to them.
 
+The button pre-fills `@yourbot deliver_<token>` in the asker's input box; sending it is what
+fetches the file. Enabling inline mode for the bot (BotFather → `/setinline`) makes that a single
+tap, and the same payload is then answered as an inline result too.
+
 Slash commands are not routed in guest chats — each command would consume a second reply slot —
 so the bot answers those with a short note instead.
 
