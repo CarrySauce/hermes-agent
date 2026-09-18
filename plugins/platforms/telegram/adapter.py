@@ -6561,18 +6561,28 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as _e:
             logger.debug("[%s] Could not load guest update_ids: %s", self.name, _e)
 
+    async def _answer_guest_query_returning(self, guest_query_id: str, result, *, log_label: str):
+        """Answer a guest query and hand back ``(ok, sent)``.
+
+        ``_answer_guest_query`` discards the response, and the helper that does return an
+        ``inline_message_id`` reads its query id from ``_pending_guest_queries`` — which, while a
+        turn is in flight, deliberately still holds the ORIGINAL id. Adopting a *new* message as
+        the surface needs both: an explicit query id and the id of the message it produced.
+        """
+        try:
+            return True, await self._bot.answer_guest_query(guest_query_id, result)
+        except Exception as exc:
+            logger.warning("[%s] guest %s failed: %s", self.name, log_label, exc)
+            return False, None
+
     async def _answer_guest_query(self, guest_query_id: str, result, *, log_label: str) -> bool:
         """Answer a guest query with *result* (an ``InlineQueryResult``); True on success.
 
         Never raises — a guest chat has no fallback delivery path, so a failure here
         is a dead end for the turn either way; logging and swallowing is all there is
         to do."""
-        try:
-            await self._bot.answer_guest_query(guest_query_id, result)
-            return True
-        except Exception as exc:
-            logger.warning("[%s] guest %s failed: %s", self.name, log_label, exc)
-            return False
+        ok, _sent = await self._answer_guest_query_returning(guest_query_id, result, log_label=log_label)
+        return ok
 
     # -- Guest-mode attachments (Bot API 10.0) --------------------------------
     #
@@ -6890,6 +6900,22 @@ class TelegramAdapter(BasePlatformAdapter):
         for store in (self._guest_inline_chats, self._guest_prompt_texts, self._guest_chat_types):
             while len(store) > self._GUEST_INLINE_MAP_MAX:
                 store.pop(next(iter(store)), None)
+        self._trim_guest_surface_generations()
+
+    def _trim_guest_surface_generations(self) -> None:
+        """Bound the per-chat generation map, never at the cost of a chat mid-turn.
+
+        Every typed answer migrates the surface, so a long conversation walks through many
+        messages — but the generation is keyed by CHAT, not by message, so it only grows with
+        distinct chats. Evicting a live one would reset it to 0 and make every write that
+        captured a higher generation look current again, so those are skipped.
+        """
+        while len(self._guest_surface_generations) > self._GUEST_INLINE_MAP_MAX:
+            victim = next(
+                (cid for cid in self._guest_surface_generations if not self._is_guest_chat(cid)), None)
+            if victim is None:
+                return
+            self._guest_surface_generations.pop(victim, None)
 
     def _guest_context_for_inline_message(self, inline_message_id: Any) -> Optional[Dict[str, Any]]:
         """The chat context recorded for *inline_message_id*, or None when it is unknown."""
@@ -7095,6 +7121,52 @@ class TelegramAdapter(BasePlatformAdapter):
         self._finish_guest_prompt(cid, imi, text, on_sent, parse_mode=parse_mode)
         logger.info("[%s] %s drawn on the guest inline message (chat=%s)", self.name, what, cid)
         return SendResult(success=True, message_id=None)
+
+    async def _migrate_guest_surface(self, chat_id: str, guest_query_id: str) -> bool:
+        """Adopt the typed answer's own message as the turn's surface.
+
+        A button tap creates no message, so a resolved choice rightly keeps the card it was
+        tapped on. Typed text does create one, and it is the newest thing in the chat — answering
+        it with a dead "got it" leaves the real reply in a message ABOVE it, so the user ends up
+        replying to the ack, the one message guaranteed to contain nothing. Answering with a
+        thinking stub and re-pointing the surface at it makes the chat read as a conversation:
+        question, the user's answer, the reply to that answer.
+
+        Returns False when the answer failed or carried no ``inline_message_id``; the surface then
+        stays where it is, because a failed migration must never leave the reply nowhere to go.
+        Nothing is written to the OLD message — whatever it last showed (the question, or
+        "Awaiting typed response…") is the record of where the interaction stood.
+        """
+        cid = str(chat_id)
+        verb = random.choice(_THINKING_VERBS)
+        stub_text = f"⏳ {verb}..."
+        ok, sent = await self._answer_guest_query_returning(
+            guest_query_id,
+            InlineQueryResultArticle(
+                id="clarify-ack", title=f"{verb}...",
+                input_message_content=InputTextMessageContent(stub_text),
+            ),
+            log_label="clarify-continuation stub",
+        )
+        imi = getattr(sent, "inline_message_id", None) if ok else None
+        if not isinstance(imi, str) or not imi:
+            logger.warning(
+                "[%s] Guest surface migration skipped (chat=%s answered=%s): keeping the current surface",
+                self.name, cid, ok)
+            return False
+        # _finish_guest_prompt is the one place that knows the full re-point: surface id,
+        # generation bump (so writes that captured the old surface are dropped), reverse map for
+        # a later tap. It also clears the undeliverable mark, which must SURVIVE a migration —
+        # the question that could not be drawn is still the one being waited on, and its
+        # plain-text retry would still only reach a buffer nothing can flush until it is answered.
+        undeliverable = cid in self._guest_prompt_undeliverable
+        self._finish_guest_prompt(cid, imi, stub_text, None, parse_mode=None)
+        if undeliverable:
+            self._guest_prompt_undeliverable.add(cid)
+        logger.info(
+            "[%s] Guest surface moved to the typed answer's message (chat=%s imi=%s)",
+            self.name, cid, imi)
+        return True
 
     async def _handle_guest_delivery_request(self, guest_query_id: str, token: str, chat_id_str: str) -> None:
         """Answer a ``deliver_<token>`` guest message with the cached media it names.
@@ -7311,18 +7383,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # above has already established this text resolves the pending question.
                 self._record_guest_answer(
                     chat_id_str, self._pending_guest_question(_continuation), _continuation.text)
-                # The fresh query id this message arrived with is answered on the spot: the turn
-                # keeps writing to the ORIGINAL inline message, so without this the caller's own
-                # message would sit there unanswered.
-                await self._answer_guest_query(
-                    guest_query_id,
-                    InlineQueryResultArticle(
-                        id="clarify-ack", title="Got it",
-                        input_message_content=InputTextMessageContent(
-                            "✅ Got it — continuing the reply above."),
-                    ),
-                    log_label="clarify-continuation ack",
-                )
+                # Answer the fresh query this message arrived with, and move the turn onto the
+                # message that answer produces: the reply belongs under the text it answers, not
+                # in a card further up the chat. Before the enqueue below, so the resumed turn —
+                # its stream edits, the batch's next question, the final flush — all read the new
+                # surface. A failed migration keeps the old one rather than losing the reply.
+                await self._migrate_guest_surface(chat_id_str, guest_query_id)
                 logger.info(
                     "[%s] Guest clarify continuation routed into the in-flight turn (chat=%s)",
                     self.name, chat_id_str)

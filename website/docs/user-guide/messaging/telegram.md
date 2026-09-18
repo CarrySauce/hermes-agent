@@ -1184,8 +1184,11 @@ question and take its buttons with it.
 
 **Typed answers.** Tapping `✏️ Other`, or answering an open-ended question, means typing into the
 chat while the turn is still running. That message is recognised as the answer the turn is waiting
-for and routed into it, so the turn resumes; the bot acknowledges it and keeps writing its reply to
-the original message. Anything the prompt would not accept as an answer — a slash command, an
+for and routed into it, so the turn resumes — and the reply moves with it: the bot answers your
+message, and everything after that (the rest of the reply, the batch's next question) is written
+there rather than in the card further up. The card you answered keeps whatever it last showed, as
+the record of where the interaction stood. A button tap creates no message, so a tapped answer
+stays in the card it was tapped on, exactly as before. Anything the prompt would not accept as an answer — a slash command, an
 attachment, an unrelated question while the buttons are still up — gets the usual "still working on
 a previous request" reply instead, so nothing is silently swallowed.
 

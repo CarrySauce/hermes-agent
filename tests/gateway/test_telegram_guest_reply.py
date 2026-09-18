@@ -1624,3 +1624,163 @@ async def test_undeliverable_next_question_fails_instead_of_parking_the_turn(cla
     retry = await adapter.send("42", "❓ Pick a word\n\n  1. Hello")
     assert retry.success is False
     assert retry.error == "guest_prompt_undeliverable"
+
+
+# ---------------------------------------------------------------------------
+# Surface migration on a typed answer
+#
+# A tap creates no message, so a resolved choice keeps the card it was tapped on.
+# Typed text creates one, and it is the newest thing in the chat — answering it
+# with a dead "got it" left the real reply in a message above it, which is why
+# users ended up replying to the ack.
+# ---------------------------------------------------------------------------
+
+def _migrating_adapter(clarify_session, *, new_imi="imi_new"):
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    adapter._bot.answer_guest_query = AsyncMock(return_value=MagicMock(inline_message_id=new_imi))
+    return adapter, clarify_gateway, session_key
+
+
+@pytest.mark.asyncio
+async def test_typed_answer_moves_the_surface_to_its_own_message(clarify_session):
+    """The reply belongs under the text it answers, not in a card further up."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c1", session_key, "What should I call it?", None)
+
+    await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=61, gqid="gq_typed")
+
+    assert adapter._guest_inline_message_ids["42"] == "imi_new"
+    # The turn's reply then flushes into that new message, not the one above.
+    adapter._guest_reply_buffer["42"] = "Done — it's Atlas now."
+    event = MagicMock()
+    event.source.chat_id = "42"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    edits = adapter._bot.edit_message_text.await_args_list
+    assert edits and all(c.kwargs["inline_message_id"] == "imi_new" for c in edits)
+
+
+@pytest.mark.asyncio
+async def test_migration_leaves_the_old_message_untouched(clarify_session):
+    """After ✏️ Other the old card still reads "Awaiting typed response…" — nothing rewrites it."""
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c2", session_key, "Which day?", ["Mon", "Tue"])
+    clarify_gateway.mark_awaiting_text("c2")
+
+    await _deliver_guest_text(adapter, "@testbot next Friday", update_id=62, gqid="gq_other_typed")
+
+    # The migration's only write is the stub on the NEW message; the old imi gets nothing.
+    for call in adapter._bot.edit_message_text.await_args_list:
+        assert call.kwargs.get("inline_message_id") != "imi_abc"
+
+
+@pytest.mark.asyncio
+async def test_button_tap_does_not_move_the_surface(clarify_session):
+    """Regression guard: a tap creates no message, so there is nothing to migrate to."""
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c3", session_key, "Which day?", ["Mon", "Tue"])
+    adapter._clarify_state["c3"] = session_key
+    query = _tap(adapter, data="cl:c3:0")
+    cb = adapter._callback_ctx(query)
+
+    with patch.object(adapter, "_callback_authorized", new=AsyncMock(return_value=True)), \
+         patch("tools.clarify_gateway.resolve_gateway_clarify", side_effect=lambda *a: True):
+        await adapter._handle_clarify_callback(query, "cl:c3:0", cb)
+
+    assert adapter._guest_inline_message_ids["42"] == "imi_abc"
+    adapter._bot.answer_guest_query.assert_not_called()
+    query.edit_message_text.assert_awaited_once()  # the echo, in place, as before
+
+
+@pytest.mark.asyncio
+async def test_batch_next_question_is_drawn_on_the_migrated_surface(clarify_session):
+    """q1 must follow the conversation down, carrying the answers so far."""
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("q0", session_key, "What should I call it?", None)
+
+    await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=63, gqid="gq_batch_typed")
+    await adapter.send_clarify(
+        chat_id="42", question="Which colour?", choices=["Blue"], clarify_id="q1",
+        session_key=session_key)
+
+    drawn = adapter._bot.edit_message_text.await_args_list[-1]
+    assert drawn.kwargs["inline_message_id"] == "imi_new"
+    assert "Which colour?" in drawn.kwargs["text"]
+    assert "call it Atlas" in drawn.kwargs["text"]  # the recorded answer rides above it
+
+
+@pytest.mark.asyncio
+async def test_migration_without_an_inline_message_id_keeps_the_old_surface(clarify_session):
+    """A failed migration must never leave the reply with nowhere to go."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, clarify_gateway, session_key = clarify_session
+    adapter._remember_guest_inline_message("42", "imi_abc")
+    adapter._bot.answer_guest_query = AsyncMock(return_value=MagicMock(inline_message_id=None))
+    clarify_gateway.register("c4", session_key, "What should I call it?", None)
+
+    await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=64, gqid="gq_no_imi")
+
+    assert adapter._guest_inline_message_ids["42"] == "imi_abc"
+    adapter._guest_reply_buffer["42"] = "Done."
+    event = MagicMock()
+    event.source.chat_id = "42"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert adapter._bot.edit_message_text.await_args.kwargs["inline_message_id"] == "imi_abc"
+
+
+@pytest.mark.asyncio
+async def test_migration_bumps_the_generation_and_the_later_flush_survives_it(clarify_session):
+    """The 3d8b1c69 invariant holds across a migration, in both directions."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c5", session_key, "What should I call it?", None)
+    before = adapter._guest_surface_generation("42")
+    stale_query = _tap(adapter, data="cl:c5:0")
+    stale_cb = adapter._callback_ctx(stale_query)     # captured against the OLD surface
+
+    await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=65, gqid="gq_gen")
+
+    assert adapter._guest_surface_generation("42") > before
+    # A write decided before the migration is dropped…
+    await adapter._edit_html_quiet(stale_query, "stale echo", generation=stale_cb["guest_generation"])
+    stale_query.edit_message_text.assert_not_called()
+    # …while the flush that comes after it is not.
+    adapter._guest_reply_buffer["42"] = "Done — it's Atlas now."
+    event = MagicMock()
+    event.source.chat_id = "42"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert adapter._bot.edit_message_text.await_args.kwargs["inline_message_id"] == "imi_new"
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_typed_answer_neither_resolves_nor_migrates(clarify_session):
+    """Fail-closed: the gate sits above the continuation branch, so nothing moves."""
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c6", session_key, "What should I call it?", None)
+    update, _msg = _make_guest_update(update_id=66, gqid="gq_stranger", text="@testbot call it Atlas")
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=False), \
+         patch.object(adapter, "_enqueue_text_event") as enqueued:
+        await adapter._handle_guest_message_update(update, MagicMock())
+
+    enqueued.assert_not_called()
+    adapter._bot.answer_guest_query.assert_not_called()
+    assert adapter._guest_inline_message_ids["42"] == "imi_abc"
+    assert clarify_gateway.has_pending(session_key) is True
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_an_undeliverable_prompt_mark(clarify_session):
+    """A question that could not be drawn is still the one being waited on."""
+    adapter, clarify_gateway, session_key = _migrating_adapter(clarify_session)
+    clarify_gateway.register("c7", session_key, "What should I call it?", None)
+    adapter._guest_prompt_undeliverable.add("42")
+
+    await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=67, gqid="gq_undeliv")
+
+    assert "42" in adapter._guest_prompt_undeliverable
