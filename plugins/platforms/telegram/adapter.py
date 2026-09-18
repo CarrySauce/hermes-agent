@@ -7495,6 +7495,29 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._cache_and_route_media(msg, event)
             return
 
+        # Media on the message this one replies to. The member text path picks it up inside
+        # _build_triggered_event; the guest path open-codes the event build (it cleans the trigger
+        # text differently) and dropped this hop, so "@bot what do you hear?" sent as a reply to
+        # someone's video reached the model as a bare quoted line with no file at all — while the
+        # same video attached to the mention itself analysed fine.
+        _reply_msg = getattr(msg, "reply_to_message", None)
+        if _reply_msg is not None:
+            _replied_source = self._observed_media_source(_reply_msg)[0]
+            # One line per guest reply: without it the next occurrence of this class of bug is
+            # again indistinguishable between "Telegram sent no media", "we never looked" and
+            # "the download failed" (the last two log their own lines below).
+            logger.info(
+                "[%s] Guest reply context (chat=%s replied_media=%s)",
+                self.name, chat_id_str, _replied_source is not None)
+            if _replied_source is not None:
+                # Same reason as the has_media branch above: the download and whatever runs over
+                # it take seconds, and on the text path the stub otherwise waits for send_typing.
+                # _guest_fire_text_stub is idempotent, so the later firing becomes a no-op.
+                await self._guest_fire_text_stub(chat_id_str)
+                # Gated on there being something to fetch: a reply to plain text keeps the
+                # timing it has today, with no download attempt behind it.
+                await self._cache_replied_media(msg, event)
+
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 

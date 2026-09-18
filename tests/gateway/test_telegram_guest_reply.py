@@ -1784,3 +1784,91 @@ async def test_migration_preserves_an_undeliverable_prompt_mark(clarify_session)
     await _deliver_guest_text(adapter, "@testbot call it Atlas", update_id=67, gqid="gq_undeliv")
 
     assert "42" in adapter._guest_prompt_undeliverable
+
+
+# ---------------------------------------------------------------------------
+# Media on the message a guest mention replies to
+#
+# The member text path caches it inside _build_triggered_event; the guest path
+# open-codes the event build and skipped that hop, so "@bot what do you hear?"
+# sent as a reply to someone's video arrived as a bare quoted line.
+# ---------------------------------------------------------------------------
+
+class _CachedStub:
+    """What cache_media_bytes_async hands back, reduced to what _attach_cached reads."""
+
+    def __init__(self, kind="video", path="/tmp/cache/clip.mp4", media_type="video/mp4"):
+        self.kind, self.path, self.media_type = kind, path, media_type
+        self.display_name = path.rsplit("/", 1)[-1]
+
+    def context_note(self):
+        return f"[{self.kind}]"
+
+
+def _make_reply_target(kind=None):
+    """A replied-to Message: every media field explicit, since a bare mock is all-truthy."""
+    reply = MagicMock()
+    reply.text = "Только я одна это слышу..? X))"
+    reply.caption = None
+    for attr in ("photo", "video", "audio", "voice", "document", "sticker"):
+        setattr(reply, attr, None)
+    if kind == "photo":
+        reply.photo = [MagicMock(file_id="replied_photo", file_size=2048)]
+    elif kind:
+        setattr(reply, kind, MagicMock(file_id=f"replied_{kind}", file_size=2048, file_name=f"a.{kind}"))
+    return reply
+
+
+async def _deliver_guest_reply(adapter, *, reply_target, text="@testbot что ты там слышишь?", update_id=81):
+    update, msg = _make_guest_update(update_id=update_id, gqid="gq_reply", text=text)
+    msg.reply_to_message = reply_target
+    captured = {}
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_apply_telegram_group_observe_attribution", side_effect=lambda e: e), \
+         patch.object(adapter, "_enqueue_text_event", side_effect=lambda e: captured.update(event=e)):
+        await adapter._handle_guest_message_update(update, MagicMock())
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_to_a_video_attaches_the_replied_media():
+    """The reported case: the turn must see the file, not just the quoted caption."""
+    adapter = _make_adapter()
+    cached = _CachedStub()
+
+    with patch.object(adapter, "_download_observed_media", new=AsyncMock(return_value=("ok", cached))):
+        captured = await _deliver_guest_reply(adapter, reply_target=_make_reply_target("video"))
+
+    event = captured["event"]
+    assert event.media_urls == ["/tmp/cache/clip.mp4"]
+    assert event.media_types == ["video/mp4"]
+    assert "Replied-to video" in event.text
+    # The download takes seconds, so the caller gets the ⏳ before it starts.
+    adapter._bot.answer_guest_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_to_plain_text_keeps_its_current_timing():
+    """No media to fetch: nothing is downloaded and the stub is not fired early."""
+    adapter = _make_adapter()
+
+    with patch.object(adapter, "_download_observed_media", new=AsyncMock()) as download:
+        captured = await _deliver_guest_reply(adapter, reply_target=_make_reply_target(None), update_id=82)
+
+    download.assert_not_called()
+    assert captured["event"].media_urls == []
+    adapter._bot.answer_guest_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_media_download_failure_still_delivers_the_turn():
+    """A failed download degrades to the text turn rather than dropping it."""
+    adapter = _make_adapter()
+
+    with patch.object(adapter, "_download_observed_media", new=AsyncMock(return_value=("failed", None))):
+        captured = await _deliver_guest_reply(adapter, reply_target=_make_reply_target("voice"), update_id=83)
+
+    assert captured["event"].media_urls == []
+    assert captured["event"].text  # the turn still runs, on the text alone
+
