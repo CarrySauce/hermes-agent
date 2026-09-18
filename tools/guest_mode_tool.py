@@ -76,6 +76,16 @@ def mint_token(
     return token
 
 
+def consume_token(token: str) -> bool:
+    """Spend *token* once its delivery actually succeeded; False if it was already gone.
+
+    Redemption resolves WITHOUT consuming and calls this only after the send came back ok, so a
+    delivery Telegram refused leaves the button tappable. Spending it up front is what turned a
+    failed send into a dead button that then blamed the caller for an expired link.
+    """
+    return _TOKEN_STORE.pop(token, None) is not None
+
+
 def resolve_token(token: str, *, consume: bool = True) -> Optional[Dict[str, Any]]:
     """Return the record for *token*, or ``None`` when unknown or expired.
 

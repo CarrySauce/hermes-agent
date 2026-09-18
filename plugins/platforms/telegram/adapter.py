@@ -119,7 +119,7 @@ try:
         InlineQueryResultArticle, InputTextMessageContent,
         InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo,
         InlineQueryResultCachedAudio, InlineQueryResultCachedDocument,
-        InlineQueryResultCachedMpeg4Gif,
+        InlineQueryResultCachedMpeg4Gif, InlineQueryResultCachedVoice,
     )
     try:
         from telegram import LinkPreviewOptions
@@ -139,7 +139,7 @@ except ImportError:
     InlineQueryResultArticle = InputTextMessageContent = Any
     InlineQueryResultCachedPhoto = InlineQueryResultCachedVideo = Any
     InlineQueryResultCachedAudio = InlineQueryResultCachedDocument = Any
-    InlineQueryResultCachedMpeg4Gif = Any
+    InlineQueryResultCachedMpeg4Gif = InlineQueryResultCachedVoice = Any
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -4644,14 +4644,23 @@ class TelegramAdapter(BasePlatformAdapter):
         # caller, which is exactly what the guest-message branch achieves the other way.
         _inline_token = self._guest_delivery_token(getattr(inline_query, "query", "") or "")
         if _inline_token:
-            from tools.guest_mode_tool import resolve_token
-            _record = resolve_token(_inline_token)
+            from tools.guest_mode_tool import consume_token, resolve_token
+            # Same consume-on-success rule as the guest-message branch: a refused answer must
+            # leave the token redeemable rather than spend it on a file that never arrived.
+            _record = resolve_token(_inline_token, consume=False)
             try:
                 await inline_query.answer(
                     [self._guest_cached_media_result(_record, result_id="delivery")] if _record else [],
                     cache_time=0, is_personal=True)
-            except Exception:
-                logger.debug("[%s] inline delivery answer failed", self.name, exc_info=True)
+                if _record:
+                    consume_token(_inline_token)
+            except Exception as _inline_exc:
+                logger.warning(
+                    "[%s] inline delivery answer failed (token kept redeemable): %s",
+                    self.name, _redact_telegram_error_text(_inline_exc))
+                with contextlib.suppress(Exception):
+                    await inline_query.answer(
+                        [self._guest_delivery_failed_result()], cache_time=0, is_personal=True)
             return
         try:
             from telegram import InlineQueryResultArticle, InputTextMessageContent
@@ -6753,8 +6762,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     "chat_id": normalize_telegram_chat_id(staging_chat), kwarg: fh,
                     "disable_notification": True,
                 }
-                if kind == "document" and file_name:
+                if file_name and kind in {"document", "audio"}:
                     kwargs["filename"] = file_name
+                if kind == "audio":
+                    # The cached-audio result has no title of its own: it shows the one stored
+                    # with the file. A track extracted from a video carries no ID3 tags, so
+                    # without this Telegram mints a title-less file_id and then refuses the
+                    # redemption with "Audio_title_empty" — the button just looks dead.
+                    kwargs["title"] = (file_name or resolved.name or "").strip() or "Audio"
                 sent = await send(**kwargs)
         except Exception as exc:
             logger.warning(
@@ -6812,7 +6827,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return InlineQueryResultCachedMpeg4Gif(id=result_id, mpeg4_file_id=file_id, caption=caption)
         if kind == "video":
             return InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title=title, caption=caption)
-        if kind in {"audio", "voice"}:
+        if kind == "voice":
+            # A voice file_id is not an audio file_id either; ``title`` is required on this one.
+            return InlineQueryResultCachedVoice(
+                id=result_id, voice_file_id=file_id, title=title, caption=caption)
+        if kind == "audio":
+            # InlineQueryResultCachedAudio has no title field — Telegram renders the one stored
+            # with the file, which is why _guest_stage_file must not mint a title-less audio.
             return InlineQueryResultCachedAudio(id=result_id, audio_file_id=file_id, caption=caption)
         return InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title=title, caption=caption)
 
@@ -7168,6 +7189,14 @@ class TelegramAdapter(BasePlatformAdapter):
             self.name, cid, imi)
         return True
 
+    def _guest_delivery_failed_result(self, *, result_id: str = "delivery_failed"):
+        """The result shown when a redemption's send was refused; the token stays tappable."""
+        return InlineQueryResultArticle(
+            id=result_id, title="Couldn't send the file",
+            input_message_content=InputTextMessageContent(
+                "⚠️ That file couldn't be delivered just now — tap the button again to retry."),
+        )
+
     async def _handle_guest_delivery_request(self, guest_query_id: str, token: str, chat_id_str: str) -> None:
         """Answer a ``deliver_<token>`` guest message with the cached media it names.
 
@@ -7176,8 +7205,12 @@ class TelegramAdapter(BasePlatformAdapter):
         are single-use and short-lived; anything unknown or stale gets the error result
         rather than a silent no-reply the caller can't distinguish from an outage.
         """
-        from tools.guest_mode_tool import resolve_token
-        record = resolve_token(token)
+        from tools.guest_mode_tool import consume_token, resolve_token
+        # Resolved without consuming: the token is spent below, and only once Telegram has
+        # actually accepted the file. Consuming here is what made a refused delivery (an audio
+        # file_id minted without a title, say) a permanent dead end — nothing on screen, a log
+        # line claiming success, and a button that then blamed the caller for an expired link.
+        record = resolve_token(token, consume=False)
         if not record:
             await self._answer_guest_query(
                 guest_query_id,
@@ -7190,8 +7223,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 log_label="delivery expired reply",
             )
             return
-        await self._answer_guest_query(
-            guest_query_id, self._guest_cached_media_result(record), log_label="delivery reply")
+        if not await self._answer_guest_query(
+                guest_query_id, self._guest_cached_media_result(record), log_label="delivery reply"):
+            # The answer failed, so the query is still unanswered and answering it again is the
+            # only way to put anything on screen. Wording deliberately distinct from the expired
+            # case: the two are indistinguishable in a screenshot otherwise.
+            await self._answer_guest_query(
+                guest_query_id, self._guest_delivery_failed_result(), log_label="delivery failure reply")
+            return
+        consume_token(token)
         logger.info("[%s] Delivered guest attachment (chat=%s kind=%s)", self.name, chat_id_str, record.get("media_kind"))
 
     def _gateway_session_key(self, event: MessageEvent) -> Optional[str]:

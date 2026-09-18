@@ -13,6 +13,7 @@ how PTB >=22.8 actually models Bot API 10.0 guest bots (there is no api_kwargs
 involved). Every fixture below builds updates that shape, not a raw dict.
 """
 
+import logging
 import os
 import sys
 import time
@@ -95,6 +96,11 @@ class _FakeInlineQueryResultCachedDocument:
         self.id, self.document_file_id, self.title = id, document_file_id, title
 
 
+class _FakeInlineQueryResultCachedVoice:
+    def __init__(self, *, id, voice_file_id, title=None, **_kw):
+        self.id, self.voice_file_id, self.title = id, voice_file_id, title
+
+
 class _FakeInlineKeyboardButton:
     def __init__(self, text, switch_inline_query_current_chat=None, **_kw):
         self.text = text
@@ -114,6 +120,7 @@ def _real_inline_result_classes(monkeypatch):
     monkeypatch.setattr(_tg_adapter_mod, "InlineQueryResultCachedPhoto", _FakeInlineQueryResultCachedPhoto)
     monkeypatch.setattr(_tg_adapter_mod, "InlineQueryResultCachedAudio", _FakeInlineQueryResultCachedAudio)
     monkeypatch.setattr(_tg_adapter_mod, "InlineQueryResultCachedDocument", _FakeInlineQueryResultCachedDocument)
+    monkeypatch.setattr(_tg_adapter_mod, "InlineQueryResultCachedVoice", _FakeInlineQueryResultCachedVoice)
     monkeypatch.setattr(_tg_adapter_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
     monkeypatch.setattr(_tg_adapter_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
 
@@ -1872,3 +1879,91 @@ async def test_guest_reply_media_download_failure_still_delivers_the_turn():
     assert captured["event"].media_urls == []
     assert captured["event"].text  # the turn still runs, on the text alone
 
+
+# ---------------------------------------------------------------------------
+# Delivering staged audio
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_audio_staging_sends_a_non_empty_title(tmp_path, monkeypatch):
+    """Cached-audio results render the file's stored title; empty means Audio_title_empty."""
+    path = _staged_file(tmp_path, monkeypatch, name="audio_b2c94.mp3", data=b"id3-less bytes")
+    adapter = _make_adapter()
+    _register_guest_chat(adapter)
+    sent = MagicMock()
+    sent.audio = MagicMock(file_id="fid_audio")
+    adapter._bot.send_audio = AsyncMock(return_value=sent)
+
+    result = await adapter.send_document("42", str(path))
+
+    assert result.success is True
+    kwargs = adapter._bot.send_audio.await_args.kwargs
+    assert kwargs["title"] == "audio_b2c94.mp3"
+    assert kwargs["filename"] == "audio_b2c94.mp3"
+
+
+@pytest.mark.asyncio
+async def test_voice_and_audio_build_their_own_result_types():
+    """A voice file_id is not an audio file_id — Telegram rejects the swap."""
+    adapter = _make_adapter()
+
+    voice = adapter._guest_cached_media_result(
+        {"file_id": "fid_voice", "media_kind": "voice", "file_name": "note.ogg"})
+    assert voice.voice_file_id == "fid_voice"
+    assert voice.title  # required on this result type
+
+    audio = adapter._guest_cached_media_result(
+        {"file_id": "fid_audio", "media_kind": "audio", "file_name": "track.mp3"})
+    assert audio.audio_file_id == "fid_audio"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_delivery_keeps_the_token_and_says_so(caplog):
+    """The reported dead end: nothing sent, "delivered" logged, and the token burnt."""
+    import tools.guest_mode_tool as gmt
+    gmt._TOKEN_STORE.clear()
+    token = gmt.mint_token("fid_audio", "audio", file_name="audio_b2c94.mp3")
+
+    adapter = _make_adapter()
+    adapter._bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("Audio_title_empty"))
+    update, _msg = _make_guest_update(update_id=91, gqid="gq_fail", text=f"deliver_{token}")
+
+    with caplog.at_level(logging.INFO), \
+         patch.object(adapter, "_is_callback_user_authorized", return_value=True):
+        await adapter._handle_guest_message_update(update, MagicMock())
+
+    assert "Delivered guest attachment" not in caplog.text
+    # The failure is put on screen, in wording distinct from the expired-token case…
+    assert adapter._bot.answer_guest_query.await_count == 2
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "delivery_failed"
+    # …and the token is still redeemable, so tapping again is a real retry.
+    assert token in gmt._TOKEN_STORE
+
+    adapter._bot.answer_guest_query = AsyncMock(return_value=MagicMock(inline_message_id="imi"))
+    retry, _msg2 = _make_guest_update(update_id=92, gqid="gq_retry", text=f"deliver_{token}")
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
+        await adapter._handle_guest_message_update(retry, MagicMock())
+    assert adapter._bot.answer_guest_query.await_args.args[1].audio_file_id == "fid_audio"
+    assert token not in gmt._TOKEN_STORE  # spent only now that it actually arrived
+    gmt._TOKEN_STORE.clear()
+
+
+@pytest.mark.asyncio
+async def test_inline_redemption_keeps_the_token_when_the_answer_fails():
+    """Same consume-on-success rule on the inline path (§B.4)."""
+    import tools.guest_mode_tool as gmt
+    gmt._TOKEN_STORE.clear()
+    token = gmt.mint_token("fid_photo", "photo")
+
+    adapter = _make_adapter()
+    inline_query = MagicMock()
+    inline_query.query = f"deliver_{token}"
+    inline_query.from_user = MagicMock(id=123, username="someone")
+    inline_query.answer = AsyncMock(side_effect=[RuntimeError("boom"), None])
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
+        await adapter._handle_inline_query(MagicMock(inline_query=inline_query), MagicMock())
+
+    assert token in gmt._TOKEN_STORE
+    assert inline_query.answer.await_args.args[0][0].id == "delivery_failed"
+    gmt._TOKEN_STORE.clear()
