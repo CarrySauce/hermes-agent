@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import html as _html
 import re
 import time
@@ -105,7 +106,21 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    _tv_ns: dict = {}
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thinking_verbs.py"), encoding="utf-8") as _tv_f:
+        exec(_tv_f.read(), _tv_ns)
+    _THINKING_VERBS: list = _tv_ns.get("THINKING_VERBS") or ["Thinking"]
+except Exception:
+    _THINKING_VERBS = ["Thinking"]
+
+try:
+    from telegram import (
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup,
+        InlineQueryResultArticle, InputTextMessageContent,
+        InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo,
+        InlineQueryResultCachedAudio, InlineQueryResultCachedDocument,
+        InlineQueryResultCachedMpeg4Gif, InlineQueryResultCachedVoice,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -121,6 +136,10 @@ except ImportError:
     Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = Application = Any
     CommandHandler = CallbackQueryHandler = InlineQueryHandler = TypeHandler = TelegramMessageHandler = HTTPXRequest = Any
     LinkPreviewOptions = filters = ParseMode = ChatType = None
+    InlineQueryResultArticle = InputTextMessageContent = Any
+    InlineQueryResultCachedPhoto = InlineQueryResultCachedVideo = Any
+    InlineQueryResultCachedAudio = InlineQueryResultCachedDocument = Any
+    InlineQueryResultCachedMpeg4Gif = InlineQueryResultCachedVoice = Any
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -149,6 +168,21 @@ from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from utils import env_float, env_int
+
+class _GuestInlinePrompt:
+    """What a control prompt "sent" into a guest chat: an inline message, so no ``message_id``.
+
+    ``_send_prompt``'s ``on_sent`` hooks take the returned Message to remember where the prompt
+    landed. An inline message has an ``inline_message_id`` instead (tracked separately, keyed by
+    chat), so this carries the chat and an explicit ``None`` rather than a fabricated id.
+    """
+
+    __slots__ = ("chat_id",)
+    message_id = None
+
+    def __init__(self, chat_id: str) -> None:
+        self.chat_id = chat_id
+
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -495,6 +529,54 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         self._bot_identity_refresh_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
+        # Bot API 10.0 guest mode: chat_id → guest_query_id for answerGuestQuery
+        self._pending_guest_queries: Dict[str, str] = {}
+        # chat IDs that are guest-mode only (bot not a member)
+        self._guest_only_chats: set = set()
+        # accumulated send() content for guest chats; flushed via editMessageText in on_processing_complete
+        self._guest_reply_buffer: Dict[str, str] = {}
+        # inline_message_id returned by the stub answerGuestQuery; used for the follow-up editMessageText
+        self._guest_inline_message_ids: Dict[str, Optional[str]] = {}
+        # Dedup set for guest_message update_ids: PTB resets its polling offset to 0 on restart,
+        # so Telegram re-delivers unacknowledged updates.  We persist the last seen update_id to
+        # _GUEST_UPDATE_ID_FILE and skip updates whose ids we've already processed.
+        self._seen_guest_update_ids: set = set()
+        self._last_guest_update_id: int = 0
+        # Attachments staged during the current guest turn: chat_id → the most recent
+        # {"file_id", "media_kind", ...} record, and the full per-turn list behind it.
+        # on_processing_complete turns these into deliver_<token> buttons (a guest bot
+        # cannot push a file into a chat it hasn't joined; the caller redeems it).
+        self._guest_turn_media: Dict[str, Dict[str, Any]] = {}
+        self._guest_turn_media_all: Dict[str, List[Dict[str, Any]]] = {}
+        # Staging cache: resolved path → {"mtime", "size", "file_id"}. A regenerated file at
+        # the same path (new mtime/size) re-uploads instead of serving the stale file_id.
+        self._guest_staged_file_ids: Dict[str, Dict[str, Any]] = {}
+        # chat_id → media_group_id of the album the in-flight guest turn is collecting, so the
+        # album's 2nd..Nth guest messages merge into that turn instead of hitting the busy reply.
+        self._guest_media_group_ids: Dict[str, str] = {}
+        # chat_id → Telegram chat type of the guest chat, so a button tap (which carries no
+        # ``message``, hence no chat) is authorized against the same tuple the inbound message was.
+        self._guest_chat_types: Dict[str, str] = {}
+        # inline_message_id → {"chat_id", "chat_type"}: the reverse map a callback on an inline
+        # message needs. Outlives the turn (a tap can land late) and is bounded, not per-turn state.
+        self._guest_inline_chats: Dict[str, Dict[str, Any]] = {}
+        # inline_message_id → rendered prompt text, standing in for ``query.message.text`` when a
+        # handler echoes the question back into its edit.
+        self._guest_prompt_texts: Dict[str, str] = {}
+        # Chats only ever reached as a guest. Outlives the turn so an advisory send that lands
+        # between turns is refused cleanly instead of spending a request on a certain "Forbidden".
+        self._known_guest_chats: Dict[str, float] = {}
+        # chat_id → generation of the one inline message that chat has. Bumped by every question
+        # drawn on it; a write that captured an older generation is dropped rather than allowed to
+        # clobber a newer one (see _guest_surface_write_is_stale).
+        self._guest_surface_generations: Dict[str, int] = {}
+        # chat_id → [(question, answer)] already answered in this turn's clarify batch. One surface
+        # means the next question REPLACES the previous card, so these ride along above it.
+        self._guest_answered_lines: Dict[str, List[tuple]] = {}
+        # Chats whose last control prompt could not be drawn. Consumed by the next non-stream
+        # send() so the gateway's plain-text retry of that prompt fails too instead of buffering
+        # into a void the turn cannot flush while it waits for that prompt's answer.
+        self._guest_prompt_undeliverable: set = set()
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -2786,6 +2868,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
+        # Guest messages (Bot API 10.0) must be claimed BEFORE the normal text/command/media
+        # handlers below: MessageFilter.check_update passes them Update.effective_message,
+        # which also surfaces update.guest_message (there is no update.message for a guest
+        # chat the bot hasn't joined) — so filters.TEXT etc. would otherwise ALSO match a
+        # guest update and run the normal reply pipeline against it, which fails with
+        # "Forbidden: bot is not a member" since it tries a real sendMessage. PTB tries
+        # handlers within one group in registration order and stops at the first match, so
+        # registering this first in the default group (not a separate group) is what makes
+        # it take priority over — not run alongside — the handlers that follow.
+        app.add_handler(TelegramMessageHandler(filters.UpdateType.GUEST_MESSAGE, self._handle_guest_message_update))
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
@@ -2796,6 +2888,7 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
+
         # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
@@ -3047,6 +3140,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
+            # Restore seen guest update_ids so restart doesn't reprocess old updates.
+            self._load_guest_update_ids()
+            # Register handlers via the single registration site (#64176) —
+            # includes the guest_message TypeHandler (see _register_handlers).
             self._register_handlers(self._app)
             await self._initialize_app_with_retries(builder)
             await self._app.start()
@@ -3477,9 +3574,124 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
+            # Guest streaming: when stream consumer strips the full MEDIA: tag the
+            # adapter receives empty content, but an intermediate chunk ("MEDIA" with
+            # no colon) may already be sitting in the guest reply buffer.  Clear it
+            # so OPC doesn't edit the stub with the raw "MEDIA" fragment.
+            _cid_str_early = str(chat_id)
+            if (bool(metadata and (metadata.get("expect_edits") or metadata.get("notify")))
+                    and self._is_guest_chat(_cid_str_early)):
+                _buf_early = self._guest_reply_buffer.get(_cid_str_early, "")
+                if _buf_early:
+                    _buf_cleaned = re.sub(r"(?i)^MEDIA:?\s*\S*\s*", "", _buf_early).strip()
+                    if _buf_cleaned != _buf_early:
+                        self._guest_reply_buffer[_cid_str_early] = _buf_cleaned
             return SendResult(success=True, message_id=None)
         error_types = self._telegram_error_types()
         try:
+            # Bot API 10.0 guest reply: buffer content and return immediately.
+            # Must run before the rich/legacy send paths — both use sendMessage
+            # which Telegram rejects with Forbidden when the bot is not a member.
+            # Normalize to string: all guest dicts use str keys (_handle_guest_message_update
+            # stores chat_id_str = str(msg.chat.id)); chat_id here may arrive as int from
+            # the event source, which would silently miss every dict lookup.
+            _cid_str = str(chat_id)
+            if self._is_guest_chat(_cid_str):
+                # Tool-use progress blocks (💻 terminal etc.) come through
+                # send() from send_progress_messages().  The stream consumer
+                # always sets expect_edits=True on the first frame and
+                # notify=True on the fallback-final send; tool-progress calls
+                # have neither flag.  Drop anything that isn't from the stream
+                # consumer so the guest reply contains only the LLM response.
+                _is_stream_send = bool(
+                    metadata
+                    and (metadata.get("expect_edits") or metadata.get("notify"))
+                )
+                if not _is_stream_send:
+                    # Tool-progress call from send_progress_messages().  Fire the
+                    # thinking stub on first contact so the user sees immediate
+                    # feedback — no content classification, the stub always fires.
+                    if self._guest_inline_message_ids.get(_cid_str) is False:
+                        await self._guest_fire_text_stub(_cid_str)
+                    if _cid_str in self._guest_prompt_undeliverable:
+                        # The prompt this text is retrying could not be drawn. Buffering it would
+                        # report success for something only on_processing_complete can show, and
+                        # OPC cannot run until the question is answered — the parked-waiter hang.
+                        self._guest_prompt_undeliverable.discard(_cid_str)
+                        logger.warning(
+                            "[%s] Refusing the plain-text retry of an undeliverable guest prompt (chat=%s)",
+                            self.name, _cid_str)
+                        return SendResult(success=False, error="guest_prompt_undeliverable")
+                    if not self._guest_has_delivery_surface(_cid_str):
+                        # Neither an inline message to edit nor an unspent query: this text can
+                        # never reach the chat. Reporting success here is what let an
+                        # undeliverable clarify prompt read as delivered — the gateway's
+                        # plain-text fallback takes a successful send as proof it arrived and
+                        # then waits for an answer to a question nobody ever saw.
+                        return SendResult(success=False, error="guest_no_inline_message")
+                    return SendResult(success=True, message_id=None)
+
+                # Streaming: fire the stub now if it hasn't fired yet (covers responses
+                # where send_typing() was skipped and no tool-progress call ran).
+                # False = slot open, stub not fired → fire now.
+                # None  = stub fired but Telegram returned no imi → buffer fallback.
+                # str   = real imi → live streaming edits.
+                _imi_val = self._guest_inline_message_ids.get(_cid_str)
+                if _imi_val is False:
+                    await self._guest_fire_text_stub(_cid_str)
+                    _imi_val = self._guest_inline_message_ids.get(_cid_str)
+
+                # Stub fired (imi available or not) — buffer mode: accumulate
+                # content so OPC delivers the full response at once.
+                _cursor = " ▉"
+                _clean = content
+                if _clean.endswith(_cursor):
+                    _clean = _clean[:-len(_cursor)]
+                elif _clean.endswith("▉"):
+                    _clean = _clean[:-1]
+                # Streaming sends cumulative chunks; MEDIA: tags are stripped by the
+                # stream consumer only once the full path (including extension) appears.
+                # Intermediate chunks like "MEDIA:" or "MEDIA:/workspace/file" don't
+                # match the extension-anchored cleanup regex and land in the buffer.
+                # Strip any MEDIA: residuals here so they never appear as text.
+                _raw_clean = _clean  # pre-strip value for cumulative-replace detection below
+                if "MEDIA:" in _clean:
+                    _clean = re.sub(r"MEDIA:\s*\S+", "", _clean).strip()
+
+                _existing = self._guest_reply_buffer.get(_cid_str, "")
+                if metadata and metadata.get("guest_segment_start"):
+                    # Stream consumer had a tool-call segment break on a __no_edit__
+                    # platform: inter-tool commentary was cleared in the consumer and
+                    # this is the start of the final-answer delivery.  Replace the
+                    # buffer so preamble text ("searching...", failed-tool narration)
+                    # from earlier segments does not appear in the answerGuestQuery.
+                    self._guest_reply_buffer[_cid_str] = _clean
+                elif _existing and _raw_clean.startswith(_existing):
+                    # Cumulative streaming update: the raw (pre-strip) frame
+                    # contains all prior content as a prefix → replace so the
+                    # last call wins.  Comparing against _raw_clean (not the
+                    # post-strip _clean) handles the case where a partial "MEDIA"
+                    # chunk landed in the buffer first, and the next cumulative
+                    # frame "MEDIA: /path.ext" strips to "" — the raw frame still
+                    # starts with "MEDIA" so we correctly replace (clearing the
+                    # partial token) rather than appending "" to "MEDIA".
+                    self._guest_reply_buffer[_cid_str] = _clean
+                else:
+                    # Continuation or overflow chunk: content does NOT start
+                    # with what we already have → append.
+                    self._guest_reply_buffer[_cid_str] = _existing + _clean
+                return SendResult(success=True, message_id=None)
+            if _cid_str in self._known_guest_chats:
+                # A chat we have only ever reached as a guest, with no turn in flight to carry a
+                # reply: sendMessage here is answered with "Forbidden: bot is not a member", every
+                # time. Advisory traffic that lands between turns (busy-session notices, a late
+                # follow-up) used to spend a request and an ERROR line on that. Cleared the moment
+                # a real member message arrives, so a bot later added to the group is not stuck.
+                logger.info(
+                    "[%s] Skipping send to guest-only chat %s: no turn in flight, so no surface",
+                    self.name, _cid_str)
+                return SendResult(success=False, error="guest_chat_no_surface", retryable=False)
+
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
             if self._should_attempt_rich(content, metadata=metadata):
@@ -3538,6 +3750,10 @@ class TelegramAdapter(BasePlatformAdapter):
         append a fresh bubble on every call. With this method, the first call sends and the message id is
         remembered; subsequent calls with the same (chat_id, status_key) edit that same message in place.
         """
+        # Guest chats have no existing message to edit and status messages would
+        # consume the one-shot query_id before the real answer is ready.
+        if self._is_guest_chat(chat_id):
+            return SendResult(success=True, message_id=None)
         key = (str(chat_id), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
@@ -3581,6 +3797,51 @@ class TelegramAdapter(BasePlatformAdapter):
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        # __no_edit__ is the stream consumer's sentinel for "no streaming edits needed".
+        # Guard here so the stream consumer can pass it through without crashing int(message_id).
+        if message_id == "__no_edit__":
+            return SendResult(success=True, message_id=message_id)
+
+        # Guest mode: stream consumer drives progressive edits via inline_message_id.
+        # Intercept before any path that calls int(chat_id)/int(message_id) — the
+        # inline_message_id is a string like "AAMCAgAD..." that cannot be cast to int.
+        _imi = self._guest_inline_message_ids.get(str(chat_id))
+        if isinstance(_imi, str) and message_id == _imi:
+            _text = content
+            for _cur in (" ▉", "▉"):
+                if _text.endswith(_cur):
+                    _text = _text[: -len(_cur)]
+                    break
+            # Strip MEDIA: directives that the stream consumer passes through raw.
+            if "MEDIA:" in _text:
+                _text = re.sub(r"MEDIA:\S+", "", _text).strip()
+                _text = re.sub(r"\n{3,}", "\n\n", _text)
+            # Keep buffer current with the latest raw (pre-format) text so that
+            # on_processing_complete can do a finalize edit if the stream consumer's
+            # own finalize edit fails mid-stream (e.g. API error or truncated chunk).
+            if _text.strip():
+                self._guest_reply_buffer[str(chat_id)] = _text
+            _text = (_strip_mdv2(self.format_message(_text)) if finalize else _text)[:4096]
+            if not _text.strip():
+                return SendResult(success=True, message_id=message_id)
+            try:
+                await self._bot.edit_message_text(text=_text, inline_message_id=_imi)
+                return SendResult(success=True, message_id=message_id)
+            except Exception as _ie:
+                _ie_s = str(_ie).lower()
+                if "not modified" in _ie_s:
+                    return SendResult(success=True, message_id=message_id)
+                logger.warning(
+                    "[%s] guest inline editMessageText failed (imi=%s): %s",
+                    self.name, _imi, _ie,
+                )
+                return SendResult(
+                    success=False,
+                    error=str(_ie),
+                    retryable="retry after" in _ie_s or "flood" in _ie_s,
+                )
+
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -3803,6 +4064,10 @@ class TelegramAdapter(BasePlatformAdapter):
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        # Guest chats: draft streaming requires an existing message to animate;
+        # the bot is not a member, so suppress silently.
+        if self._is_guest_chat(chat_id):
+            return SendResult(success=True, message_id=None)
         # Rich draft fast-path; any failure degrades to the plain draft below. Drafts have no message_id.
         if self._should_attempt_rich_draft(content) and await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
             return SendResult(success=True, message_id=None)
@@ -3889,6 +4154,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(built, SendResult):
                 return built
             text, keyboard, on_sent = built
+            # Guest chats have no sendMessage: the bot is not a member, so the control path below
+            # dies with "Forbidden" and the caller waits on a prompt that never rendered. The one
+            # surface a guest bot owns is the inline message its query was answered with.
+            if self._is_guest_chat(chat_id):
+                return await self._send_guest_prompt(
+                    what, chat_id, text, keyboard, on_sent,
+                    parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2)
             msg = await self._send_control_message(
                 chat_id, text, parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
@@ -4040,8 +4312,10 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await query.edit_message_text(text=self.format_message(result_text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
         except Exception:
-            with contextlib.suppress(Exception):
+            try:
                 await query.edit_message_text(text=result_text, parse_mode=None, reply_markup=None)
+            except Exception as exc:
+                self._log_callback_edit_failure(query, exc)
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
@@ -4288,24 +4562,57 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             await query.answer()  # e.g. page-counter button "mx:noop"
 
-    async def _notify_clarify_expired(self, query, user_display: str) -> None:
+    async def _notify_clarify_expired(self, query, user_display: str, *, generation: Optional[int] = None) -> None:
         """Tell the user a clarify tap arrived too late (entry evicted or gateway restarted) — otherwise
         the tap leaves a misleading ✓ the agent never sees."""
         with contextlib.suppress(Exception):
             await query.answer(text="⚠️ This prompt expired — please /retry.")
         await self._edit_html_quiet(
-            query, f"❓ {_html.escape(query.message.text or '')}\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>")
+            query,
+            f"❓ {_html.escape(self._callback_prompt_text(query))}"
+            "\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>",
+            generation=generation)
 
-    @staticmethod
-    async def _edit_html_quiet(query, text: str) -> None:
-        """HTML edit with the keyboard removed; failures ignored (non-fatal)."""
-        with contextlib.suppress(Exception):
+    def _log_callback_edit_failure(self, query, exc: Exception) -> None:
+        """Log a post-tap edit that failed: debug for an ordinary message, warning for an inline one.
+
+        On the guest route this edit is the only thing that makes the tap visible, so swallowing
+        its failure leaves a prompt that looks frozen and a log that says nothing.
+        """
+        if getattr(query, "message", None) is None:
+            logger.warning(
+                "[%s] inline-message callback edit failed (imi=%s): %s", self.name,
+                getattr(query, "inline_message_id", None), _redact_telegram_error_text(exc))
+        else:
+            logger.debug("[%s] callback edit failed: %s", self.name, _redact_telegram_error_text(exc))
+
+    async def _edit_html_quiet(self, query, text: str, *, generation: Optional[int] = None) -> None:
+        """HTML edit with the keyboard removed; failures are non-fatal but never silent.
+
+        PTB targets ``inline_message_id`` automatically when ``query.message`` is None, so this
+        works unchanged for a guest prompt. ``generation`` (from ``cb["guest_generation"]``) makes
+        the edit drop itself when the one guest surface has moved on to a newer question — without
+        it this write strips that question's keyboard and the turn waits on an invisible card.
+        """
+        if self._guest_surface_write_is_stale(query, generation):
+            return
+        try:
             await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as exc:
+            self._log_callback_edit_failure(query, exc)
 
-    async def _edit_md_quiet(self, query, text_md: str) -> None:
-        """MarkdownV2 edit with the keyboard removed; failures ignored (non-fatal)."""
-        with contextlib.suppress(Exception):
-            await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+    async def _edit_md_quiet(self, query, text_md: str, *, generation: Optional[int] = None) -> None:
+        """MarkdownV2 edit with the keyboard removed; failures are non-fatal but never silent.
+
+        ``generation`` drops the edit when the guest surface has moved on (see _edit_html_quiet).
+        """
+        if self._guest_surface_write_is_stale(query, generation):
+            return
+        try:
+            await query.edit_message_text(
+                text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+        except Exception as exc:
+            self._log_callback_edit_failure(query, exc)
 
     async def _handle_inline_query(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Answer ``@botname <query>`` with a searchable command/skill picker (the ``/`` menu is capped at
@@ -4331,6 +4638,30 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[%s] inline picker empty answer failed", self.name, exc_info=True)
             return
+        # Attachment redemption: with inline mode enabled, the delivery button's pre-filled
+        # "@bot deliver_<token>" reaches us as an inline query instead of a guest message.
+        # Same token, same single use — answering here posts the file into the chat as the
+        # caller, which is exactly what the guest-message branch achieves the other way.
+        _inline_token = self._guest_delivery_token(getattr(inline_query, "query", "") or "")
+        if _inline_token:
+            from tools.guest_mode_tool import consume_token, resolve_token
+            # Same consume-on-success rule as the guest-message branch: a refused answer must
+            # leave the token redeemable rather than spend it on a file that never arrived.
+            _record = resolve_token(_inline_token, consume=False)
+            try:
+                await inline_query.answer(
+                    [self._guest_cached_media_result(_record, result_id="delivery")] if _record else [],
+                    cache_time=0, is_personal=True)
+                if _record:
+                    consume_token(_inline_token)
+            except Exception as _inline_exc:
+                logger.warning(
+                    "[%s] inline delivery answer failed (token kept redeemable): %s",
+                    self.name, _redact_telegram_error_text(_inline_exc))
+                with contextlib.suppress(Exception):
+                    await inline_query.answer(
+                        [self._guest_delivery_failed_result()], cache_time=0, is_personal=True)
+            return
         try:
             from telegram import InlineQueryResultArticle, InputTextMessageContent
             from plugins.platforms.telegram.inline_picker import CACHE_TIME_SECONDS as _CACHE, build_inline_results
@@ -4349,14 +4680,42 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] inline picker answer failed", self.name, exc_info=True)
 
-    @staticmethod
-    def _callback_ctx(query) -> Dict[str, Any]:
-        """Chat/thread/user context of a button tap, for the callback auth gate."""
+    def _callback_ctx(self, query) -> Dict[str, Any]:
+        """Chat/thread/user context of a button tap, for the callback auth gate.
+
+        A tap on an INLINE message — every guest-chat prompt — has ``message`` set to None and
+        carries ``inline_message_id`` instead, so the chat is recovered from the mapping the
+        prompt recorded. That keeps the tap gated on the same (user, chat, chat_type) tuple the
+        inbound guest message was gated on. When the mapping is gone the context stays all-None
+        and the dispatcher refuses the tap, rather than letting it be evaluated as a DM.
+        """
         query_message = getattr(query, "message", None)
+        if query_message is None:
+            guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
+            return {
+                "chat_id": (guest or {}).get("chat_id"), "chat_type": (guest or {}).get("chat_type"),
+                "thread_id": None, "user_name": getattr(getattr(query, "from_user", None), "first_name", None),
+                # Read BEFORE the handler resolves anything: resolving releases the thread that
+                # draws the batch's next question, and whatever this tap decides to write is
+                # stale from that moment on.
+                "guest_generation": self._guest_surface_generation((guest or {}).get("chat_id") or "")}
         query_chat = getattr(query_message, "chat", None)
         return {
             "chat_id": getattr(query_message, "chat_id", None), "chat_type": getattr(query_chat, "type", None),
-            "thread_id": getattr(query_message, "message_thread_id", None), "user_name": getattr(query.from_user, "first_name", None)}
+            "thread_id": getattr(query_message, "message_thread_id", None),
+            "user_name": getattr(query.from_user, "first_name", None),
+            # An ordinary chat gives every card its own message, so there is nothing to race for.
+            "guest_generation": None}
+
+    def _callback_prompt_text(self, query) -> str:
+        """Text of the message a tap came from — ``query.message.text``, or, for an inline
+        message (guest mode, where ``message`` is None), the prompt text recorded when it was
+        drawn. Empty string when neither exists; every caller only echoes it back into an edit."""
+        query_message = getattr(query, "message", None)
+        if query_message is not None:
+            return getattr(query_message, "text", None) or ""
+        inline_message_id = getattr(query, "inline_message_id", None)
+        return (self._guest_prompt_texts.get(str(inline_message_id)) or "") if inline_message_id else ""
 
     async def _callback_authorized(self, query, cb: Dict[str, Any], denial_text: str) -> bool:
         """Gate a button tap on the callback allowlist; answers ``denial_text`` when refused."""
@@ -4375,12 +4734,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         data = query.data
         cb = self._callback_ctx(query)
+        if getattr(query, "message", None) is None and cb["chat_id"] is None:
+            # A tap on an inline message we cannot attribute to a chat (gateway restart, or the
+            # bounded mapping aged out): there is no context to authorize against, so refuse.
+            # Falling through would hand the gate a chat-less, DM-shaped source.
+            logger.warning(
+                "[%s] callback on an unattributable inline message (imi=%s); refusing",
+                self.name, getattr(query, "inline_message_id", None))
+            with contextlib.suppress(Exception):
+                await query.answer(text="⚠️ This prompt expired — please ask again.")
+            return
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
             (("cp:",), self._handle_choice_picker_callback)):
             if data.startswith(prefixes):
-                chat_id = str(query.message.chat_id) if query.message else None
+                # cb["chat_id"], not query.message: an inline-message tap has no message, and
+                # reading it off one silently did nothing at all for every guest picker.
+                chat_id = str(cb["chat_id"]) if cb["chat_id"] is not None else None
                 if chat_id:
                     await handler(query, data, chat_id)
                 return
@@ -4441,7 +4812,7 @@ class TelegramAdapter(BasePlatformAdapter):
             label = "⌛ Approval expired"
             edit_text = f"{label} — no command was waiting. It already timed out (and was denied) or was resolved elsewhere."
         await query.answer(text=label)
-        await self._edit_md_quiet(query, edit_text)
+        await self._edit_md_quiet(query, edit_text, generation=cb.get("guest_generation"))
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
             self.resume_typing_for_chat(str(cb["chat_id"]))
@@ -4462,12 +4833,18 @@ class TelegramAdapter(BasePlatformAdapter):
         user_display = getattr(query.from_user, "first_name", "User")
         label = label_map.get(choice, "Resolved")
         await query.answer(text=label)
-        await self._edit_md_quiet(query, f"{label} by {user_display}")
+        await self._edit_md_quiet(query, f"{label} by {user_display}", generation=cb.get("guest_generation"))
         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
         try:
             from tools import slash_confirm as _slash_confirm_mod
             result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
-            if result_text and query.message:
+            if result_text and query.message is None:
+                # Inline prompt (guest chat): there is no chat to post a follow-up into — the
+                # message we just edited is the whole surface, so the result goes on it.
+                await self._edit_md_quiet(
+                    query, f"{label} by {user_display}\n\n{result_text}",
+                    generation=cb.get("guest_generation"))
+            elif result_text and query.message:
                 # Inherit the prompt's topic: forums use message_thread_id; private DM-topic lanes need
                 # both the topic id and the prompt reply anchor.
                 thread_id = getattr(query.message, "message_thread_id", None)
@@ -4517,11 +4894,14 @@ class TelegramAdapter(BasePlatformAdapter):
             if not flipped:
                 # Entry evicted / gateway restarted — a typed answer would go nowhere.
                 self._clarify_state.pop(clarify_id, None)
-                await self._notify_clarify_expired(query, user_display)
+                await self._notify_clarify_expired(query, user_display, generation=cb.get("guest_generation"))
                 return
             await query.answer(text="✏️ Type your answer in the chat.")
             await self._edit_html_quiet(
-                query, f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>")
+                query,
+                f"❓ {self._callback_prompt_text(query)}"
+                f"\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
+                generation=cb.get("guest_generation"))
             return
         # Numeric choice → resolve immediately with the chosen text
         try:
@@ -4530,9 +4910,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="Invalid choice.")
             return
         resolved_text: Optional[str] = None
+        question_text = ""
         try:
             from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
             entry = _clarify_entries.get(clarify_id)
+            question_text = getattr(entry, "question", "") or ""
             if entry and entry.choices and 0 <= idx < len(entry.choices):
                 resolved_text = entry.choices[idx]
         except Exception:
@@ -4541,6 +4923,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # Race (timeout / session reset): echo the index so the agent sees an intentional response.
             resolved_text = f"choice {idx + 1}"
         self._clarify_state.pop(clarify_id, None)
+        # Record BEFORE resolving: resolving is what releases the thread that draws the batch's
+        # next question, and that draw renders this list above it. Recorded after, it would always
+        # lose the race and the answer would simply vanish from the one surface the chat has.
+        if cb.get("guest_generation") is not None:
+            self._record_guest_answer(cb.get("chat_id") or "", question_text, resolved_text)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
             resolved = resolve_gateway_clarify(clarify_id, resolved_text)
@@ -4550,11 +4937,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if resolved:
             await query.answer(text=f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
-                query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
+                query,
+                f"❓ {_html.escape(self._callback_prompt_text(query))}"
+                f"\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}",
+                generation=cb.get("guest_generation"))
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
         else:
             # Entry evicted / gateway restarted between ask and tap.
-            await self._notify_clarify_expired(query, user_display)
+            await self._notify_clarify_expired(query, user_display, generation=cb.get("guest_generation"))
             logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
@@ -4563,7 +4953,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
             return
         await query.answer(text=f"Sent '{answer}' to the update process.")
-        await self._edit_md_quiet(query, f"☤ Update prompt answered: *{'Yes' if answer == 'y' else 'No'}*")
+        await self._edit_md_quiet(
+            query, f"☤ Update prompt answered: *{'Yes' if answer == 'y' else 'No'}*",
+            generation=cb.get("guest_generation"))
         try:
             from hermes_constants import get_hermes_home
             response_path = get_hermes_home() / ".update_response"
@@ -4633,7 +5025,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await query.answer(text=label)
         if not success:
             return
-        original_text = (query.message.text or "") if query.message else ""
+        original_text = self._callback_prompt_text(query)
         appended = f"{original_text}\n— {label} by {getattr(query.from_user, 'first_name', 'User')}"
         # Sticky state verbs keep the keyboard so further actions can stack; one-shots strip it (can't fire twice).
         with contextlib.suppress(Exception):
@@ -4854,6 +5246,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        _guest = await self._guest_stage_outbound(
+            chat_id, self._guest_media_kind_for_path(audio_path, is_voice=bool(kwargs.get("is_voice"))),
+            audio_path, caption=caption)
+        if _guest is not None:
+            return _guest
         _transcoded_voice_path: Optional[str] = None
         try:
             if not os.path.exists(audio_path):
@@ -4901,6 +5298,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         if not images:
             return SendResult(success=False, error="no images to send")
+        if self._is_guest_chat(chat_id):
+            return await self._guest_stage_outbound_images(chat_id, images)
         try:
             from telegram import InputMediaPhoto
         except Exception as exc:  # pragma: no cover - missing SDK
@@ -4974,6 +5373,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
+        _guest = await self._guest_stage_outbound(chat_id, "photo", image_path, caption=caption)
+        if _guest is not None:
+            return _guest
         # Pre-compress large raster images to progressive JPEG once; the photo send and the document
         # fallback both reuse the compressed file so either upload stays under media_write_timeout.
         compressed = self._compress_image_to_jpeg(image_path)
@@ -5035,6 +5437,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
+        _guest = await self._guest_stage_outbound(
+            chat_id, self._guest_media_kind_for_path(file_path), file_path, caption=caption,
+            file_name=file_name or os.path.basename(file_path))
+        if _guest is not None:
+            return _guest
         return await self._send_local_file(
             "File", file_path, chat_id, reply_to, metadata, "document",
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
@@ -5047,6 +5454,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a video natively as a Telegram video message."""
+        _guest = await self._guest_stage_outbound(chat_id, "video", video_path, caption=caption)
+        if _guest is not None:
+            return _guest
         return await self._send_local_file(
             "Video", video_path, chat_id, reply_to, metadata, "video",
             lambda f: {"video": f, "caption": self._caption_1024(caption)},
@@ -5143,6 +5553,17 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id):
             return
+
+        _cid_str = str(chat_id)
+        # For guest-only chats fire the stub unconditionally on the first send_typing()
+        # call.  Platform does no content classification — the stub always fires so the
+        # user sees immediate feedback, and OPC edits it with the final text reply.
+        if (
+            _cid_str in self._guest_only_chats
+            and self._guest_inline_message_ids.get(_cid_str) is False
+        ):
+            await self._guest_fire_text_stub(_cid_str)
+
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
 
@@ -5317,6 +5738,44 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
         return self._extra_bool("guest_mode", "TELEGRAM_GUEST_MODE", "false")
+
+    # Every guest-mode container, with the factory that builds an empty one. Kept beside
+    # _ensure_guest_state so adding state can't leave a partially-initialized adapter behind.
+    _GUEST_STATE_DEFAULTS = (
+        ("_pending_guest_queries", dict), ("_guest_only_chats", set), ("_guest_reply_buffer", dict),
+        ("_guest_inline_message_ids", dict), ("_guest_turn_media", dict), ("_guest_turn_media_all", dict),
+        ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
+        ("_guest_chat_types", dict), ("_guest_inline_chats", dict), ("_guest_prompt_texts", dict),
+        ("_known_guest_chats", dict), ("_guest_surface_generations", dict),
+        ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
+        ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
+    )
+
+    def _ensure_guest_state(self) -> None:
+        """Create any missing guest-mode bookkeeping, idempotently.
+
+        ``_is_guest_chat`` runs on every outbound message and the guest flush runs for every
+        completed turn, so neither may *require* this state to exist: an adapter built without
+        ``__init__`` (``object.__new__`` in tests, partial construction during a transient-init
+        rebuild) must still be able to send. Without this the guest feature would turn a missing
+        attribute into a failed send on a chat that has nothing to do with guest mode.
+        """
+        for name, factory in self._GUEST_STATE_DEFAULTS:
+            if not hasattr(self, name):
+                setattr(self, name, factory())
+
+    def _is_guest_chat(self, chat_id: Any) -> bool:
+        """Return whether *chat_id* is currently a guest-mode (non-member) chat.
+
+        True while a guest turn is in flight (``_pending_guest_queries``) or for
+        the remainder of processing after the query has been consumed
+        (``_guest_only_chats``). Shared by every send-path method that must
+        suppress normal ``sendMessage``-family calls in guest chats — the bot
+        isn't a member, so those calls fail with ``Forbidden``.
+        """
+        self._ensure_guest_state()
+        _cid_str = str(chat_id)
+        return self._pending_guest_queries.get(_cid_str) is not None or _cid_str in self._guest_only_chats
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
@@ -5742,6 +6201,21 @@ class TelegramAdapter(BasePlatformAdapter):
             event, text=self._telegram_group_observe_attributed_text(event),
             source=self._telegram_group_observe_shared_source(event.source), channel_prompt=channel_prompt)
 
+    # Mirrors the media filter _register_handlers installs for member chats
+    # (PHOTO | VIDEO | AUDIO | VOICE | Document.ALL | Sticker.ALL), so the guest
+    # path recognizes exactly the attachment kinds the member path handles.
+    _MEDIA_ATTRS = ("photo", "video", "audio", "voice", "document", "sticker")
+
+    def _message_has_media(self, msg: Any) -> bool:
+        """True when ``msg`` carries an attachment the media pipeline knows how to cache.
+
+        A Bot API message is either text or an attachment with an optional caption, never
+        both, so a populated ``text`` settles it without inspecting the attachment fields.
+        """
+        if getattr(msg, "text", None):
+            return False
+        return any(getattr(msg, attr, None) for attr in self._MEDIA_ATTRS)
+
     def _media_message_type(self, msg: Message) -> MessageType:
         """Classify a Telegram media message into a MessageType (first present attachment wins)."""
         for attr, mtype in (
@@ -5968,6 +6442,24 @@ class TelegramAdapter(BasePlatformAdapter):
         """Message-like payload for normal messages and channel posts (``update.channel_post``)."""
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _note_member_chat(self, update: Update) -> None:
+        """Forget a chat's guest-only marking once a real member message arrives from it.
+
+        ``update.message`` is populated only for a chat the bot is actually in (a guest update
+        carries ``guest_message`` instead), so this is the signal that the bot was added to a group
+        it used to answer as a guest. Without it the no-surface shortcut in ``send()`` would keep
+        refusing sends there for the life of the process.
+        """
+        message = getattr(update, "message", None)
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not chat_id:
+            return
+        self._ensure_guest_state()  # runs on the ordinary inbound path; adapters built without __init__
+        if self._known_guest_chats.pop(chat_id, None) is not None:
+            logger.info(
+                "[%s] Chat %s now delivers member messages; clearing its guest-only marking",
+                self.name, chat_id)
+
     def _log_blocked_user(self, msg, *, level=logging.WARNING, what: str = "unauthorized user") -> None:
         logger.log(
             level, "[Telegram] Blocked %s %s in chat %s", what, getattr(getattr(msg, "from_user", None), "id", None),
@@ -5990,8 +6482,1088 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
+    async def _guest_fire_text_stub(self, chat_id: str) -> None:
+        """Fire the thinking-verb stub, consuming the answerGuestQuery slot as text.
+
+        Stores the returned inline_message_id (or None on API failure) in
+        _guest_inline_message_ids so send() can drive progressive stream edits and
+        on_processing_complete can update the message with the real reply.
+        Should only be called when _guest_inline_message_ids[chat_id] is False
+        (slot open, stub not yet fired).
+        """
+        _chat_id_str = str(chat_id)
+        _guest_qid = self._pending_guest_queries.get(_chat_id_str)
+        if not _guest_qid or not self._bot:
+            return
+        if self._guest_inline_message_ids.get(_chat_id_str) is not False:
+            return  # already fired or not a guest chat
+        # Claim the slot immediately (before the await) so a concurrent caller that
+        # also passed the `is not False` check above doesn't fire a second stub.
+        self._guest_inline_message_ids[_chat_id_str] = None
+        _verb = random.choice(_THINKING_VERBS)
+        _stub = InlineQueryResultArticle(
+            id="thinking", title=f"{_verb}...",
+            input_message_content=InputTextMessageContent(f"⏳ {_verb}..."),
+        )
+        # Wrap the API call in a Task so asyncio.shield() can protect it from
+        # _keep_typing's asyncio.wait_for timeout.  When the 1.5 s timeout fires,
+        # _keep_typing cancels send_typing → CancelledError reaches shield → shield
+        # re-raises to us but the inner Task keeps running.  The done_callback
+        # captures the inline_message_id even when the outer await was timed out.
+        _fire_task: "asyncio.Task" = asyncio.ensure_future(
+            self._bot.answer_guest_query(_guest_qid, _stub)
+        )
+
+        def _on_stub_done(fut: "asyncio.Future") -> None:
+            try:
+                # SentGuestMessage.inline_message_id is a required field — if the
+                # call succeeded at all, a real id is guaranteed present.
+                _stub_imi = fut.result().inline_message_id
+                self._guest_inline_message_ids[_chat_id_str] = _stub_imi
+                # A button tap on this message carries no chat; record the way back now.
+                self._remember_guest_inline_message(_chat_id_str, _stub_imi)
+            except Exception as _e:
+                self._guest_inline_message_ids[_chat_id_str] = None
+                logger.warning(
+                    "[%s] guest stub failed (chat=%s): %s — OPC fallback will run",
+                    self.name, _chat_id_str, _e,
+                )
+
+        _fire_task.add_done_callback(_on_stub_done)
+        try:
+            await asyncio.shield(_fire_task)
+            # Happy path: shield returned normally, callback already fired or will fire.
+        except asyncio.CancelledError:
+            # _keep_typing's asyncio.wait_for timed out (or a genuine task cancel).
+            # _fire_task continues protected by shield; _on_stub_done will set imi.
+            raise
+        except Exception as _stub_err:
+            # The task raised an exception (non-timeout failure).
+            # _on_stub_done already set imi to None; just log for the outer context.
+            logger.warning(
+                "[%s] guest stub task error (chat=%s): %s",
+                self.name, _chat_id_str, _stub_err,
+            )
+
+    def _persist_guest_update_id(self, update_id: int) -> None:
+        """Save the latest processed guest update_id so restarts don't reprocess it."""
+        try:
+            from hermes_constants import get_hermes_home
+            _path = get_hermes_home() / "telegram_guest_update_id.json"
+            import json as _json
+            _path.write_text(_json.dumps({"last_update_id": update_id, "seen_ids": sorted(self._seen_guest_update_ids)[-200:]}))
+        except Exception:
+            pass
+
+    def _load_guest_update_ids(self) -> None:
+        """Restore the seen-update-id set from disk on startup."""
+        try:
+            from hermes_constants import get_hermes_home
+            import json as _json
+            _path = get_hermes_home() / "telegram_guest_update_id.json"
+            if _path.exists():
+                _data = _json.loads(_path.read_text())
+                _ids = _data.get("seen_ids") or []
+                self._seen_guest_update_ids = set(_ids)
+                self._last_guest_update_id = _data.get("last_update_id", 0)
+                logger.info("[%s] Loaded %d seen guest update_ids (last=%s)", self.name, len(_ids), self._last_guest_update_id)
+        except Exception as _e:
+            logger.debug("[%s] Could not load guest update_ids: %s", self.name, _e)
+
+    async def _answer_guest_query_returning(self, guest_query_id: str, result, *, log_label: str):
+        """Answer a guest query and hand back ``(ok, sent)``.
+
+        ``_answer_guest_query`` discards the response, and the helper that does return an
+        ``inline_message_id`` reads its query id from ``_pending_guest_queries`` — which, while a
+        turn is in flight, deliberately still holds the ORIGINAL id. Adopting a *new* message as
+        the surface needs both: an explicit query id and the id of the message it produced.
+        """
+        try:
+            return True, await self._bot.answer_guest_query(guest_query_id, result)
+        except Exception as exc:
+            logger.warning("[%s] guest %s failed: %s", self.name, log_label, exc)
+            return False, None
+
+    async def _answer_guest_query(self, guest_query_id: str, result, *, log_label: str) -> bool:
+        """Answer a guest query with *result* (an ``InlineQueryResult``); True on success.
+
+        Never raises — a guest chat has no fallback delivery path, so a failure here
+        is a dead end for the turn either way; logging and swallowing is all there is
+        to do."""
+        ok, _sent = await self._answer_guest_query_returning(guest_query_id, result, log_label=log_label)
+        return ok
+
+    # -- Guest-mode attachments (Bot API 10.0) --------------------------------
+    #
+    # A guest bot cannot push a file into a chat it hasn't joined: every outbound
+    # sendPhoto/sendVideo/sendDocument there fails with "Forbidden: bot is not a
+    # member", and answerGuestQuery only accepts *cached* media (a file_id Telegram
+    # already holds). So guest attachments run in two hops:
+    #
+    #   1. staging   — the file is uploaded once to the operator's own home channel,
+    #                  which mints a file_id (``_guest_media_send``);
+    #   2. redemption — the reply carries a "switch_inline_query_current_chat" button
+    #                  whose payload is ``deliver_<token>``. Tapping it pre-fills that
+    #                  text for the caller; sending it arrives as a NEW guest message
+    #                  with a FRESH query id, which we answer with the cached media
+    #                  (the ``deliver_`` branch of ``_handle_guest_message_update``).
+    #
+    # Path containment is enforced at step 1: only files under ``HERMES_HOME/cache``
+    # can be staged. Without it a guest-triggered turn talked into naming an arbitrary
+    # host path (the credentials store, an .env) would have it uploaded to the home
+    # channel and made redeemable — the prompt asked the model to stage under the cache
+    # dir, but nothing made it.
+
+    _GUEST_MEDIA_CACHE_SUBDIR = "cache"
+    _GUEST_STAGED_CACHE_MAX = 128
+
+    def _guest_staging_chat_id(self) -> str:
+        """Chat used to mint file_ids for guest attachments (the bot must be a member).
+
+        Explicit ``guest_staging_chat``/``TELEGRAM_GUEST_STAGING_CHAT`` wins; otherwise the
+        home channel, which is the operator's own chat by construction.
+        """
+        explicit = _extra_or_secret(
+            self.config.extra, "guest_staging_chat", "TELEGRAM_GUEST_STAGING_CHAT", "", blank_is_unset=True)
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        home_env = _extra_or_secret(self.config.extra, "home_channel_chat_id", "TELEGRAM_HOME_CHANNEL", "")
+        if home_env and str(home_env).strip():
+            return str(home_env).strip()
+        home = getattr(self.config, "home_channel", None)
+        return str(getattr(home, "chat_id", "") or "").strip()
+
+    def _guest_media_kind_for_path(self, path: str, *, is_voice: bool = False) -> str:
+        """Map a local file to the staging/send kind Telegram should use for it."""
+        ext = os.path.splitext(path)[1].lower()
+        if is_voice or ext in {".ogg", ".opus"}:
+            return "voice"
+        if ext == ".gif":
+            return "animation"
+        if ext in _TELEGRAM_IMAGE_EXTENSIONS or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            return "photo"
+        if ext in {".mp4", ".mov", ".webm", ".mkv", ".m4v"}:
+            return "video"
+        if ext in {".mp3", ".m4a", ".wav", ".flac", ".aac"}:
+            return "audio"
+        return "document"
+
+    def _guest_media_staging_hint(self) -> str:
+        """The directory the model must write guest attachments into (shown in its prompt)."""
+        try:
+            import hermes_constants
+            return str(_Path(hermes_constants.get_hermes_home()) / self._GUEST_MEDIA_CACHE_SUBDIR)
+        except Exception:  # pragma: no cover - HERMES_HOME unreadable
+            return "~/.hermes/cache"
+
+    async def _guest_media_send(
+        self, chat_id: str, kind: str, path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Stage *path* into the home channel and remember its file_id for this guest turn.
+
+        Nothing is delivered here — ``on_processing_complete`` turns what this records into
+        the deliver button. Returns a failed ``SendResult`` (never raises) so the ordinary
+        send paths can degrade the way they already do for a refused upload.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        chat_id_str = str(chat_id)
+        # Resolution and containment are DELIBERATELY separate try blocks: a path resolve()
+        # itself chokes on (embedded null byte) must not fall into the containment handler
+        # with the resolved path unbound.
+        import hermes_constants
+        try:
+            resolved = _Path(path).resolve()
+            staging_root = (_Path(hermes_constants.get_hermes_home()) / self._GUEST_MEDIA_CACHE_SUBDIR).resolve()
+        except (ValueError, OSError) as exc:
+            logger.warning("[%s] guest media path validation failed: %s", self.name, exc)
+            return SendResult(success=False, error=f"guest media path validation failed: {exc}")
+        try:
+            resolved.relative_to(staging_root)
+        except ValueError:
+            logger.warning(
+                "[%s] guest media rejected: %s is outside the allowed staging directory %s",
+                self.name, resolved, staging_root)
+            return SendResult(
+                success=False,
+                error="guest media rejected: path is outside the allowed staging directory")
+        if not resolved.is_file():
+            return SendResult(success=False, error=self._missing_media_path_error("Guest media", str(resolved)))
+        staging_chat = self._guest_staging_chat_id()
+        if not staging_chat:
+            logger.warning(
+                "[%s] guest attachment dropped: no staging chat configured "
+                "(set TELEGRAM_HOME_CHANNEL or extra.guest_staging_chat)", self.name)
+            return SendResult(success=False, error="guest media staging chat not configured")
+
+        try:
+            stat = resolved.stat()
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+        except OSError as exc:
+            return SendResult(success=False, error=f"guest media path validation failed: {exc}")
+
+        key = str(resolved)
+        cached = self._guest_staged_file_ids.get(key)
+        file_id: Optional[str] = None
+        if cached and cached.get("fingerprint") == fingerprint:
+            # Same bytes as last time: reuse the file_id instead of re-uploading. A file
+            # REgenerated at the same path has a new mtime/size, so it re-stages.
+            file_id = cached.get("file_id")
+        if not file_id:
+            file_id = await self._guest_stage_file(staging_chat, kind, resolved, file_name)
+            if not file_id and kind == "photo":
+                # sendPhoto caps at ~10 MB (and refuses odd dimensions) where sendDocument
+                # takes 50 MB. The member path has the same document fallback; a delivered
+                # file beats a refused one.
+                logger.info("[%s] guest photo staging failed; retrying as a document", self.name)
+                kind = "document"
+                file_id = await self._guest_stage_file(staging_chat, kind, resolved, file_name)
+            if not file_id:
+                return SendResult(success=False, error="guest media staging failed")
+            self._guest_staged_file_ids[key] = {"fingerprint": fingerprint, "file_id": file_id}
+            # Bounded: a long-lived gateway must not accumulate one entry per file ever
+            # staged. Oldest insertion goes first (dicts keep insertion order).
+            while len(self._guest_staged_file_ids) > self._GUEST_STAGED_CACHE_MAX:
+                self._guest_staged_file_ids.pop(next(iter(self._guest_staged_file_ids)), None)
+
+        record: Dict[str, Any] = {
+            "file_id": file_id,
+            "media_kind": kind,
+            "caption": caption,
+            "file_name": file_name or resolved.name,
+        }
+        self._guest_turn_media[chat_id_str] = record
+        self._guest_turn_media_all.setdefault(chat_id_str, []).append(record)
+        logger.info(
+            "[%s] Staged guest attachment (chat=%s kind=%s file=%s)",
+            self.name, chat_id_str, kind, resolved.name)
+        return SendResult(success=True, message_id=None)
+
+    async def _guest_stage_file(
+        self, staging_chat: str, kind: str, resolved: _Path, file_name: Optional[str],
+    ) -> Optional[str]:
+        """Upload *resolved* to *staging_chat* and return the minted file_id (None on failure)."""
+        senders = {
+            "photo": ("send_photo", "photo", "photo"),
+            "video": ("send_video", "video", "video"),
+            "audio": ("send_audio", "audio", "audio"),
+            "voice": ("send_voice", "voice", "voice"),
+            "animation": ("send_animation", "animation", "animation"),
+            "document": ("send_document", "document", "document"),
+        }
+        method_name, kwarg, attr = senders.get(kind, senders["document"])
+        send = getattr(self._bot, method_name, None)
+        if send is None:
+            return None
+        try:
+            with open(resolved, "rb") as fh:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": normalize_telegram_chat_id(staging_chat), kwarg: fh,
+                    "disable_notification": True,
+                }
+                if file_name and kind in {"document", "audio"}:
+                    kwargs["filename"] = file_name
+                if kind == "audio":
+                    # The cached-audio result has no title of its own: it shows the one stored
+                    # with the file. A track extracted from a video carries no ID3 tags, so
+                    # without this Telegram mints a title-less file_id and then refuses the
+                    # redemption with "Audio_title_empty" — the button just looks dead.
+                    kwargs["title"] = (file_name or resolved.name or "").strip() or "Audio"
+                sent = await send(**kwargs)
+        except Exception as exc:
+            logger.warning(
+                "[%s] guest media staging upload failed (kind=%s file=%s): %s",
+                self.name, kind, resolved.name, _redact_telegram_error_text(exc))
+            return None
+        holder = getattr(sent, attr, None)
+        if isinstance(holder, (list, tuple)):  # PhotoSize list, largest last
+            holder = holder[-1] if holder else None
+        file_id = getattr(holder, "file_id", None)
+        if not file_id:
+            logger.warning("[%s] guest media staging returned no file_id (kind=%s)", self.name, kind)
+            return None
+        return str(file_id)
+
+    async def _guest_stage_outbound(
+        self, chat_id: str, kind: str, path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> Optional[SendResult]:
+        """Divert an outbound attachment into guest staging, or return None for normal chats.
+
+        Every native send path funnels through here so a MEDIA: attachment behaves the same
+        in a guest chat as in a DM from the model's point of view — it asks for a file to be
+        sent, and the file arrives; only the last hop (a button the caller taps) differs.
+        """
+        if not self._is_guest_chat(chat_id):
+            return None
+        return await self._guest_media_send(chat_id, kind, path, caption=caption, file_name=file_name)
+
+    async def _guest_stage_outbound_images(self, chat_id: str, images: List[tuple]) -> SendResult:
+        """Guest-chat counterpart of the album send: stage every local image of the batch."""
+        from urllib.parse import unquote as _unquote
+        staged = 0
+        for image_url, alt_text in images:
+            if not str(image_url).startswith("file://"):
+                # A remote URL has no local file to stage; the model's text still carries it.
+                continue
+            result = await self._guest_media_send(
+                chat_id, "photo", _unquote(str(image_url)[7:]), caption=alt_text or None)
+            staged += 1 if result.success else 0
+        if staged:
+            return SendResult(success=True, message_id=None)
+        return SendResult(success=False, error="no guest-deliverable images in batch")
+
+    def _guest_cached_media_result(self, record: Dict[str, Any], *, result_id: str = "delivery"):
+        """Build the ``InlineQueryResultCached*`` that hands *record*'s file to the guest chat."""
+        kind = record.get("media_kind") or "document"
+        file_id = record.get("file_id")
+        title = record.get("file_name") or "File"
+        caption = record.get("caption") or None
+        if kind == "photo":
+            return InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id, caption=caption)
+        if kind == "animation":
+            # An animation file_id is not a video file_id — Telegram rejects the swap.
+            return InlineQueryResultCachedMpeg4Gif(id=result_id, mpeg4_file_id=file_id, caption=caption)
+        if kind == "video":
+            return InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title=title, caption=caption)
+        if kind == "voice":
+            # A voice file_id is not an audio file_id either; ``title`` is required on this one.
+            return InlineQueryResultCachedVoice(
+                id=result_id, voice_file_id=file_id, title=title, caption=caption)
+        if kind == "audio":
+            # InlineQueryResultCachedAudio has no title field — Telegram renders the one stored
+            # with the file, which is why _guest_stage_file must not mint a title-less audio.
+            return InlineQueryResultCachedAudio(id=result_id, audio_file_id=file_id, caption=caption)
+        return InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title=title, caption=caption)
+
+    _GUEST_MEDIA_BUTTON_LABELS = {
+        "photo": "🖼 Get the image", "video": "🎬 Get the video", "animation": "🎬 Get the GIF",
+        "audio": "🎵 Get the audio", "voice": "🎤 Get the voice note", "document": "📎 Get the file",
+    }
+    # Telegram renders at most a handful of buttons legibly, and each one holds a live token.
+    _GUEST_MEDIA_MAX_BUTTONS = 4
+
+    def _guest_media_keyboard(self, records: List[Dict[str, Any]]):
+        """Mint one delivery token per staged file and return (markup, hint_line).
+
+        Returns ``(None, "")`` when there is nothing to offer, so callers can keep the
+        plain-text path untouched.
+        """
+        offered = [r for r in records if r.get("file_id")][: self._GUEST_MEDIA_MAX_BUTTONS]
+        if not offered:
+            return None, ""
+        from tools.guest_mode_tool import mint_token
+        rows = []
+        for record in offered:
+            token = mint_token(
+                record["file_id"], record.get("media_kind") or "document",
+                caption=record.get("caption"), file_name=record.get("file_name"))
+            label = self._GUEST_MEDIA_BUTTON_LABELS.get(record.get("media_kind") or "document", "📎 Get the file")
+            if len(offered) > 1 and record.get("file_name"):
+                label = f"{label.split(' ', 1)[0]} {record['file_name'][:24]}"
+            rows.append([InlineKeyboardButton(label, switch_inline_query_current_chat=f"deliver_{token}")])
+        dropped = len(records) - len(offered)
+        hint = "✅ Ready — tap below to get %s here." % ("the file" if len(offered) == 1 else "the files")
+        if dropped > 0:
+            hint += f" ({dropped} more couldn't be attached in one reply.)"
+        return InlineKeyboardMarkup(rows), hint
+
+    # token_urlsafe(16) → 22 URL-safe characters; the optional @handle is what
+    # switch_inline_query_current_chat pre-fills in front of the payload.
+    _GUEST_DELIVERY_RE = re.compile(r"^(?:@[A-Za-z0-9_]{1,64}\s+)?deliver_([A-Za-z0-9_-]{8,64})$")
+
+    def _guest_delivery_token(self, text: Optional[str]) -> Optional[str]:
+        """The token of a ``deliver_<token>`` request, or None when *text* isn't one.
+
+        The button uses ``switch_inline_query_current_chat``, which pre-fills the caller's
+        input box with the bot's @handle followed by the payload — so the mention may or may
+        not survive into the text that reaches us. Both shapes resolve here, and anything
+        else (prose that merely starts with "deliver_") does not.
+        """
+        candidates = [(text or "").strip()]
+        with contextlib.suppress(Exception):
+            candidates.append(self._clean_bot_trigger_text(text or "").strip())
+        for candidate in candidates:
+            match = self._GUEST_DELIVERY_RE.match(candidate)
+            if match:
+                return match.group(1)
+        return None
+
+    # -- Guest-mode control prompts (clarify / approval / pickers) ------------
+    #
+    # Every control prompt funnels through _send_prompt → _send_control_message →
+    # sendMessage, which a guest chat rejects: the bot is not a member. The turn then
+    # hung on a prompt nobody could see. In a guest chat there is no "new message" —
+    # only the inline message already on screen — so a prompt is an EDIT of that
+    # message carrying the inline keyboard, exactly as the streaming path edits it.
+
+    _GUEST_INLINE_MAP_MAX = 256
+
+    def _remember_guest_inline_message(
+        self, chat_id: str, inline_message_id: str, *, prompt_text: Optional[str] = None,
+    ) -> None:
+        """Record inline_message_id → chat, and the prompt text drawn on it.
+
+        A button tap on an inline message carries no ``message``, so this is the only way back
+        to the chat the tap belongs to — both for the authorization gate and for handlers that
+        echo the question. Bounded and deliberately NOT torn down with the turn: a tap can land
+        long after ``on_processing_complete`` has cleared the per-turn state.
+        """
+        if not inline_message_id:
+            return
+        cid = str(chat_id)
+        key = str(inline_message_id)
+        self._guest_inline_chats[key] = {
+            "chat_id": cid, "chat_type": self._guest_chat_types.get(cid, "group")}
+        if prompt_text is not None:
+            self._guest_prompt_texts[key] = prompt_text
+        for store in (self._guest_inline_chats, self._guest_prompt_texts, self._guest_chat_types):
+            while len(store) > self._GUEST_INLINE_MAP_MAX:
+                store.pop(next(iter(store)), None)
+        self._trim_guest_surface_generations()
+
+    def _trim_guest_surface_generations(self) -> None:
+        """Bound the per-chat generation map, never at the cost of a chat mid-turn.
+
+        Every typed answer migrates the surface, so a long conversation walks through many
+        messages — but the generation is keyed by CHAT, not by message, so it only grows with
+        distinct chats. Evicting a live one would reset it to 0 and make every write that
+        captured a higher generation look current again, so those are skipped.
+        """
+        while len(self._guest_surface_generations) > self._GUEST_INLINE_MAP_MAX:
+            victim = next(
+                (cid for cid in self._guest_surface_generations if not self._is_guest_chat(cid)), None)
+            if victim is None:
+                return
+            self._guest_surface_generations.pop(victim, None)
+
+    def _guest_context_for_inline_message(self, inline_message_id: Any) -> Optional[Dict[str, Any]]:
+        """The chat context recorded for *inline_message_id*, or None when it is unknown."""
+        if not inline_message_id:
+            return None
+        return self._guest_inline_chats.get(str(inline_message_id))
+
+    def _guest_has_delivery_surface(self, chat_id: Any) -> bool:
+        """Whether anything at all can still put text in front of a guest chat.
+
+        Either an inline message to edit, or an unspent ``guest_query_id`` to answer. With
+        neither, a send is not "quietly dropped" — it is undeliverable, and saying so is what
+        keeps a caller from waiting on it.
+        """
+        cid = str(chat_id)
+        return isinstance(self._guest_inline_message_ids.get(cid), str) or bool(
+            self._pending_guest_queries.get(cid))
+
+    @staticmethod
+    def _guest_prompt_title(text: str) -> str:
+        """Short title for the one-shot answer card (the body carries the real text)."""
+        first_line = (text or "").strip().splitlines()[0] if (text or "").strip() else "Question"
+        return _strip_mdv2(first_line)[:60] or "Question"
+
+    async def _answer_guest_query_with_prompt(
+        self, chat_id: str, text: str, keyboard: Any, *, parse_mode: Any,
+    ) -> Optional[str]:
+        """Spend the one-shot guest query on the prompt itself; returns its inline_message_id.
+
+        Used only when there is no stub to edit — either none was ever fired, or firing it raised
+        (which leaves the slot unspent). Answering twice after a SUCCESSFUL stub would orphan it,
+        so callers must check the sentinel first.
+        """
+        cid = str(chat_id)
+        guest_qid = self._pending_guest_queries.get(cid)
+        if not guest_qid or not self._bot:
+            return None
+        content_kwargs = {"parse_mode": parse_mode} if parse_mode is not None else {}
+        result = InlineQueryResultArticle(
+            id="prompt", title=self._guest_prompt_title(text),
+            input_message_content=InputTextMessageContent(text, **content_kwargs),
+            reply_markup=keyboard,
+        )
+        try:
+            sent = await self._bot.answer_guest_query(guest_qid, result)
+        except Exception as exc:
+            logger.warning(
+                "[%s] guest prompt answerGuestQuery failed (chat=%s): %s",
+                self.name, cid, _redact_telegram_error_text(exc))
+            return None
+        return getattr(sent, "inline_message_id", None)
+
+    # -- One surface, several writers -----------------------------------------
+    #
+    # A guest chat has exactly ONE message the bot can write: the inline message behind
+    # _guest_inline_message_ids. The clarify batch path was written for a platform that
+    # gives each question its own message, and with one surface its two writers race —
+    # the asyncio loop echoing "you answered X" onto the card, and the agent thread that
+    # the same resolve() just unblocked, drawing the batch's NEXT question. The echo is
+    # two awaits behind, so it lands last and replaces a live question (with
+    # reply_markup=None, taking its keyboard with it). The turn then waits forever on a
+    # question nobody can see.
+    #
+    # The guard makes "an older write never overwrites a newer one" a property of the
+    # surface rather than of one call order: every question drawn bumps a per-chat
+    # generation, and a write that captured an older one is dropped.
+
+    def _guest_surface_generation(self, chat_id: Any) -> int:
+        """Current generation of *chat_id*'s inline message."""
+        self._ensure_guest_state()
+        return self._guest_surface_generations.get(str(chat_id), 0)
+
+    def _guest_surface_moved(self, chat_id: Any, generation: Optional[int]) -> bool:
+        """Whether *chat_id*'s surface has newer content than *generation* — i.e. this write lost.
+
+        Dropping the write is the point: the newer content is a question the turn is waiting on,
+        and overwriting it (with ``reply_markup=None``, no less) is what left the user looking at
+        an answered card while the turn blocked on one they never saw.
+        """
+        if generation is None:
+            return False
+        current = self._guest_surface_generation(chat_id)
+        if current <= generation:
+            return False
+        logger.info(
+            "[%s] Dropping stale guest surface write (chat=%s captured_gen=%s current_gen=%s)",
+            self.name, str(chat_id), generation, current)
+        return True
+
+    def _guest_surface_write_is_stale(self, query: Any, generation: Optional[int]) -> bool:
+        """``_guest_surface_moved`` for a button tap, whose chat comes from the inline message.
+
+        *generation* is what the surface was at when the caller decided WHAT to write — captured
+        in ``_callback_ctx`` before the tap resolved anything.
+        """
+        if generation is None:
+            return False
+        guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
+        if not guest:
+            return False
+        return self._guest_surface_moved(str(guest.get("chat_id") or ""), generation)
+
+    # Answered questions kept above the pending one. Three keeps the card readable and well
+    # inside Telegram's 4,096-character limit even with long questions.
+    _GUEST_ANSWERED_HISTORY_MAX = 3
+    _GUEST_ANSWERED_LINE_MAX = 160
+
+    def _record_guest_answer(self, chat_id: Any, question: str, answer: str) -> None:
+        """Remember an answered clarify so the batch's next card can keep it on screen.
+
+        Recorded BEFORE the clarify is resolved, which is what makes it deterministic: resolving
+        is what releases the thread that draws the next question, so by the time that draw reads
+        this list the entry is already in it.
+        """
+        if not question and not answer:
+            return
+        self._ensure_guest_state()
+        cid = str(chat_id)
+        lines = self._guest_answered_lines.setdefault(cid, [])
+        lines.append((str(question).strip(), str(answer).strip()))
+        del lines[:-self._GUEST_ANSWERED_HISTORY_MAX]
+
+    def _guest_answered_prefix(self, chat_id: Any, parse_mode: Any) -> str:
+        """Answered questions of this batch, rendered above the pending one (HTML prompts only).
+
+        With one surface the next question REPLACES the previous card, so without this the user's
+        own answer vanishes the moment the batch advances. HTML-only by construction: the prompts
+        that come in batches (clarify, exec approval) are HTML, and rendering these lines into a
+        MarkdownV2 prompt would mean escaping them a second, incompatible way.
+        """
+        if parse_mode != ParseMode.HTML:
+            return ""
+        lines = self._guest_answered_lines.get(str(chat_id)) or []
+        if not lines:
+            return ""
+        rendered = "\n".join(
+            f"✅ <i>{_html.escape(q[:self._GUEST_ANSWERED_LINE_MAX])}</i> — "
+            f"<b>{_html.escape(a[:self._GUEST_ANSWERED_LINE_MAX])}</b>"
+            for q, a in lines if q or a)
+        return f"{rendered}\n\n" if rendered else ""
+
+    def _finish_guest_prompt(
+        self, chat_id: str, inline_message_id: str, text: str, on_sent, *, parse_mode: Any,
+    ) -> None:
+        """Bookkeeping after a guest prompt is on screen: retarget edits, record the tap context."""
+        cid = str(chat_id)
+        self._guest_inline_message_ids[cid] = inline_message_id
+        # Newest content on the surface: anything decided before this point is now stale.
+        self._guest_surface_generations[cid] = self._guest_surface_generation(cid) + 1
+        self._guest_prompt_undeliverable.discard(cid)
+        # Stored unescaped so a handler echoing it produces what the user is reading, matching
+        # what ``query.message.text`` would have given for an ordinary message.
+        stored = _html.unescape(text) if parse_mode == ParseMode.HTML else text
+        self._remember_guest_inline_message(cid, inline_message_id, prompt_text=stored)
+        if on_sent is not None:
+            # The prompt lives in an inline message, which has no message_id; state that instead
+            # of inventing one (nothing reads it, and a fake id would route later edits wrong).
+            on_sent(_GuestInlinePrompt(cid))
+
+    async def _send_guest_prompt(
+        self, what: str, chat_id: str, text: str, keyboard: Any, on_sent, *, parse_mode: Any,
+    ) -> SendResult:
+        """Render a control prompt in a guest chat by editing the inline message on screen."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        cid = str(chat_id)
+        # Keep what the user already answered in this batch on screen: the next question replaces
+        # the card, so a plain replace would drop their own answers one by one.
+        text = self._guest_answered_prefix(cid, parse_mode) + text
+        imi = self._guest_inline_message_ids.get(cid)
+        if not isinstance(imi, str):
+            # False → nothing drawn yet (no typing, no tool progress before the prompt): spend the
+            # query on the prompt rather than on a stub we would edit a moment later.
+            # None  → the stub's own answerGuestQuery raised, which most likely left the slot
+            #         unspent; one retry costs nothing and is the difference between a visible
+            #         prompt and a dead turn.
+            imi = await self._answer_guest_query_with_prompt(cid, text, keyboard, parse_mode=parse_mode)
+            if not isinstance(imi, str):
+                # No surface, and none obtainable. Drop the unusable query id so the gateway's
+                # plain-text fallback fails too: a "delivered" prompt nobody can see is what
+                # turned this into a silent wait instead of an error the agent can act on.
+                self._pending_guest_queries.pop(cid, None)
+                self._guest_prompt_undeliverable.add(cid)
+                logger.warning(
+                    "[%s] %s: no inline message to draw on in guest chat %s — prompt undeliverable",
+                    self.name, what, cid)
+                return SendResult(success=False, error="guest_no_inline_message")
+            self._finish_guest_prompt(cid, imi, text, on_sent, parse_mode=parse_mode)
+            return SendResult(success=True, message_id=None)
+        try:
+            await self._bot.edit_message_text(
+                text=text, inline_message_id=imi, parse_mode=parse_mode, reply_markup=keyboard)
+        except Exception as exc:
+            # Same reasoning as the no-surface branch above: the gateway retries a failed card
+            # once as plain text, and in a guest chat that text only reaches the buffer, which is
+            # flushed at the END of the turn — a turn that cannot end while it waits for the
+            # answer to the question that just failed to render.
+            self._guest_prompt_undeliverable.add(cid)
+            logger.warning(
+                "[%s] %s: guest inline edit failed (imi=%s): %s",
+                self.name, what, imi, _redact_telegram_error_text(exc))
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+        self._finish_guest_prompt(cid, imi, text, on_sent, parse_mode=parse_mode)
+        logger.info("[%s] %s drawn on the guest inline message (chat=%s)", self.name, what, cid)
+        return SendResult(success=True, message_id=None)
+
+    async def _migrate_guest_surface(self, chat_id: str, guest_query_id: str) -> bool:
+        """Adopt the typed answer's own message as the turn's surface.
+
+        A button tap creates no message, so a resolved choice rightly keeps the card it was
+        tapped on. Typed text does create one, and it is the newest thing in the chat — answering
+        it with a dead "got it" leaves the real reply in a message ABOVE it, so the user ends up
+        replying to the ack, the one message guaranteed to contain nothing. Answering with a
+        thinking stub and re-pointing the surface at it makes the chat read as a conversation:
+        question, the user's answer, the reply to that answer.
+
+        Returns False when the answer failed or carried no ``inline_message_id``; the surface then
+        stays where it is, because a failed migration must never leave the reply nowhere to go.
+        Nothing is written to the OLD message — whatever it last showed (the question, or
+        "Awaiting typed response…") is the record of where the interaction stood.
+        """
+        cid = str(chat_id)
+        verb = random.choice(_THINKING_VERBS)
+        stub_text = f"⏳ {verb}..."
+        ok, sent = await self._answer_guest_query_returning(
+            guest_query_id,
+            InlineQueryResultArticle(
+                id="clarify-ack", title=f"{verb}...",
+                input_message_content=InputTextMessageContent(stub_text),
+            ),
+            log_label="clarify-continuation stub",
+        )
+        imi = getattr(sent, "inline_message_id", None) if ok else None
+        if not isinstance(imi, str) or not imi:
+            logger.warning(
+                "[%s] Guest surface migration skipped (chat=%s answered=%s): keeping the current surface",
+                self.name, cid, ok)
+            return False
+        # _finish_guest_prompt is the one place that knows the full re-point: surface id,
+        # generation bump (so writes that captured the old surface are dropped), reverse map for
+        # a later tap. It also clears the undeliverable mark, which must SURVIVE a migration —
+        # the question that could not be drawn is still the one being waited on, and its
+        # plain-text retry would still only reach a buffer nothing can flush until it is answered.
+        undeliverable = cid in self._guest_prompt_undeliverable
+        self._finish_guest_prompt(cid, imi, stub_text, None, parse_mode=None)
+        if undeliverable:
+            self._guest_prompt_undeliverable.add(cid)
+        logger.info(
+            "[%s] Guest surface moved to the typed answer's message (chat=%s imi=%s)",
+            self.name, cid, imi)
+        return True
+
+    def _guest_delivery_failed_result(self, *, result_id: str = "delivery_failed"):
+        """The result shown when a redemption's send was refused; the token stays tappable."""
+        return InlineQueryResultArticle(
+            id=result_id, title="Couldn't send the file",
+            input_message_content=InputTextMessageContent(
+                "⚠️ That file couldn't be delivered just now — tap the button again to retry."),
+        )
+
+    async def _handle_guest_delivery_request(self, guest_query_id: str, token: str, chat_id_str: str) -> None:
+        """Answer a ``deliver_<token>`` guest message with the cached media it names.
+
+        Callers reach here only after the authorization gate, so a token that leaks (it is
+        visible in the sender's own input box) still can't be redeemed by a stranger. Tokens
+        are single-use and short-lived; anything unknown or stale gets the error result
+        rather than a silent no-reply the caller can't distinguish from an outage.
+        """
+        from tools.guest_mode_tool import consume_token, resolve_token
+        # Resolved without consuming: the token is spent below, and only once Telegram has
+        # actually accepted the file. Consuming here is what made a refused delivery (an audio
+        # file_id minted without a title, say) a permanent dead end — nothing on screen, a log
+        # line claiming success, and a button that then blamed the caller for an expired link.
+        record = resolve_token(token, consume=False)
+        if not record:
+            await self._answer_guest_query(
+                guest_query_id,
+                InlineQueryResultArticle(
+                    id="expired", title="Something went wrong",
+                    input_message_content=InputTextMessageContent(
+                        "⚠️ Something went wrong — that delivery link was already used or has expired. "
+                        "Ask me again and I'll regenerate it."),
+                ),
+                log_label="delivery expired reply",
+            )
+            return
+        if not await self._answer_guest_query(
+                guest_query_id, self._guest_cached_media_result(record), log_label="delivery reply"):
+            # The answer failed, so the query is still unanswered and answering it again is the
+            # only way to put anything on screen. Wording deliberately distinct from the expired
+            # case: the two are indistinguishable in a screenshot otherwise.
+            await self._answer_guest_query(
+                guest_query_id, self._guest_delivery_failed_result(), log_label="delivery failure reply")
+            return
+        consume_token(token)
+        logger.info("[%s] Delivered guest attachment (chat=%s kind=%s)", self.name, chat_id_str, record.get("media_kind"))
+
+    def _gateway_session_key(self, event: MessageEvent) -> Optional[str]:
+        """The session key the gateway will route *event* under, or None if it can't be derived.
+
+        Prefers the runner's own resolver so the key is byte-identical to the one the clarify
+        intercept looks up (it honours the session store and any profile namespace); falls back to
+        the adapter-side derivation ``_photo_batch_key`` already uses when no runner is reachable
+        (a bare adapter, a multiplexed handler closure, tests).
+        """
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        resolver = getattr(runner, "_session_key_for_source", None)
+        if callable(resolver):
+            try:
+                key = resolver(event.source)
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:
+                logger.debug("[%s] runner session-key resolution failed", self.name, exc_info=True)
+        try:
+            from gateway.session import build_session_key
+            return build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                profile=self._session_key_profile(event.source))
+        except Exception:
+            logger.debug("[%s] session-key derivation failed", self.name, exc_info=True)
+            return None
+
+    def _pending_guest_question(self, event: MessageEvent) -> str:
+        """Question text of the clarify this event answers, for the on-screen batch history."""
+        session_key = self._gateway_session_key(event)
+        if not session_key:
+            return ""
+        try:
+            from tools.clarify_gateway import get_pending_for_session
+            return getattr(get_pending_for_session(session_key, include_choice_prompts=True), "question", "") or ""
+        except Exception:
+            logger.debug("[%s] pending clarify lookup failed", self.name, exc_info=True)
+            return ""
+
+    def _is_guest_clarify_continuation(self, event: MessageEvent) -> bool:
+        """Whether *event* is the typed answer the in-flight guest turn is blocked waiting for.
+
+        Conservative on purpose (see ``clarify_gateway.would_accept_text_response``): only text the
+        intercept will actually accept bypasses the busy guard. Text it would decline — a slash
+        command, prose at a still-open choice prompt, a voice note whose transcript the adapter
+        cannot see yet — keeps the busy reply, because a message routed past the guard without
+        guest registration has no surface for its own reply and would vanish.
+        """
+        session_key = self._gateway_session_key(event)
+        if not session_key:
+            return False
+        try:
+            from tools.clarify_gateway import would_accept_text_response
+            return would_accept_text_response(session_key, event.text or "")
+        except Exception:
+            logger.debug("[%s] clarify-continuation check failed", self.name, exc_info=True)
+            return False
+
+    async def _handle_guest_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle guest_message updates (Bot API 10.0 guest bot feature).
+
+        Telegram delivers @mentions from chats the bot hasn't joined as a typed
+        ``Message`` on ``update.guest_message``, carrying its own ``guest_query_id``
+        (:attr:`telegram.Message.guest_query_id`). We store that id so ``send()``
+        can answer via :meth:`telegram.Bot.answer_guest_query`, then route the
+        message through the normal text-processing pipeline.
+        """
+        if not self._telegram_guest_mode():
+            return
+        msg = update.guest_message
+        if msg is None:
+            return
+        guest_query_id = msg.guest_query_id
+        _uid = update.update_id or 0
+
+        # Dedup: PTB resets its polling offset to 0 on restart, causing Telegram to redeliver
+        # unacknowledged updates.  Skip any update_id we've already processed.
+        if _uid and _uid in self._seen_guest_update_ids:
+            return
+        if _uid:
+            self._seen_guest_update_ids.add(_uid)
+            if _uid > self._last_guest_update_id:
+                self._last_guest_update_id = _uid
+                self._persist_guest_update_id(_uid)
+            # Trim set to last 200 entries — matches the persisted on-disk cap
+            # in _persist_guest_update_id, so in-memory and reloaded-after-restart
+            # dedup coverage are consistent instead of silently differing (500 vs 200).
+            if len(self._seen_guest_update_ids) > 200:
+                _min = min(self._seen_guest_update_ids)
+                self._seen_guest_update_ids.discard(_min)
+
+        if not guest_query_id:
+            logger.warning("[%s] guest_message missing guest_query_id, skipping", self.name)
+            return
+
+        text = msg.text or getattr(msg, "caption", None) or ""
+        # A guest @mention can carry an attachment instead of (or alongside) text: a
+        # caption-less photo is still a real request, so presence of media counts as
+        # content the same way text does.
+        has_media = self._message_has_media(msg)
+        if not text.strip() and not has_media:
+            return
+
+        chat_id_str = str(msg.chat.id) if msg.chat else ""
+        if not chat_id_str:
+            return
+
+        # Caller authorization (fail-closed). Guest mode lets ANY chat that
+        # @mentions the bot reach it — _should_process_message only gates the
+        # chat/mention, never the person — so without this an unauthorized
+        # stranger who knows the @handle could drive the full LLM + tools from
+        # any group (cost, abuse, prompt-injection surface). Approval gating
+        # only stops dangerous *commands*; it does nothing about this door.
+        #
+        # The caller is msg.from_user, same as any other Telegram message.
+        # Message.guest_bot_caller_user is a DIFFERENT, unrelated field —
+        # documented for messages the bot itself sends as a guest, not for
+        # the incoming @mention. Routed through the same
+        # _is_callback_user_authorized the exec-approval buttons use, so
+        # there is ONE definition of "who's allowed" — the env allowlists
+        # (TELEGRAM_ALLOWED_USERS / group variants / GATEWAY_ALLOWED_USERS)
+        # unioned with the pairing store, with `*` as the explicit
+        # open-to-everyone opt-out. Empty allowlist or unknown caller =>
+        # deny. Placed before the busy-reply, guest-state registration AND
+        # the deliver_<token> branch so token redemption is gated too.
+        _guest_caller_id = str(getattr(msg.from_user, "id", "") or "").strip()
+        _guest_chat_type = getattr(msg.chat, "type", None)
+        if not self._is_callback_user_authorized(
+            _guest_caller_id,
+            chat_id=chat_id_str,
+            chat_type=str(_guest_chat_type) if _guest_chat_type is not None else "group",
+            user_name=(getattr(msg.from_user, "username", None) or getattr(msg.from_user, "first_name", None)),
+        ):
+            # Loud + diagnostic: if from_user is ever absent on a guest message
+            # (e.g. an anonymous-admin edge case), logging that makes a silent
+            # deny-all instantly traceable rather than looking like a backend outage.
+            logger.warning(
+                "[%s] Guest caller not authorized (caller_id=%r chat=%s); denying. has_from_user=%s",
+                self.name, _guest_caller_id, chat_id_str, msg.from_user is not None,
+            )
+            return
+
+        # Attachment redemption: the caller tapped the button on an earlier reply, which
+        # pre-filled "deliver_<token>" in their input box. That arrives here as an ordinary
+        # guest message with a FRESH query id — the one chance to answer with the file. It
+        # never registers guest turn state and never reaches the LLM: the work is already
+        # done, this is only the handover. Sits behind the authorization gate above, so a
+        # token seen over someone's shoulder still can't be redeemed by a stranger.
+        _delivery_token = self._guest_delivery_token(text)
+        if _delivery_token:
+            await self._handle_guest_delivery_request(guest_query_id, _delivery_token, chat_id_str)
+            return
+
+        # Album continuation: Telegram delivers each photo of an album as its own guest
+        # message. The first one started the turn; the rest must merge into that event
+        # (the media-group debounce below does the merging) instead of being rejected as
+        # "busy" — one album is one request, not N.
+        _media_group_id = str(getattr(msg, "media_group_id", "") or "")
+        if (
+            has_media and _media_group_id
+            and self._guest_media_group_ids.get(chat_id_str) == _media_group_id
+            and chat_id_str in self._pending_guest_queries
+        ):
+            _album_event = self._build_message_event(
+                msg, self._media_message_type(msg), update_id=update.update_id)
+            _album_event.text = self._clean_bot_trigger_text(_album_event.text)
+            await self._cache_and_route_media(msg, _album_event)
+            return
+
+        # Clarify continuation: the in-flight turn is blocked in wait_for_response waiting for
+        # exactly this text, and it holds _pending_guest_queries[chat_id] BECAUSE it is waiting.
+        # The busy guard below would therefore reject the answer the turn is waiting for — a
+        # deadlock, not a race: it fails every time, and it makes the "✏️ Other" button and every
+        # open-ended clarify unanswerable in guest mode. Route the text into the running turn the
+        # way the album branch above routes an album's later photos, and register nothing: this is
+        # not a new request, and re-registering would overwrite the query id and reset the stub
+        # sentinel, orphaning the inline message that turn is still editing. Text only: an
+        # attachment is not a typed answer, and routing one through here as a TEXT event would
+        # quietly drop the file, so it takes the busy reply like any other second request.
+        if chat_id_str in self._pending_guest_queries and not has_media:
+            _continuation = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+            _continuation.text = self._clean_bot_trigger_text(_continuation.text)
+            if self._is_guest_clarify_continuation(_continuation):
+                # Same reason as the button path: record the answer BEFORE the gateway intercept
+                # resolves it, so the batch's next question can keep it on screen. The predicate
+                # above has already established this text resolves the pending question.
+                self._record_guest_answer(
+                    chat_id_str, self._pending_guest_question(_continuation), _continuation.text)
+                # Answer the fresh query this message arrived with, and move the turn onto the
+                # message that answer produces: the reply belongs under the text it answers, not
+                # in a card further up the chat. Before the enqueue below, so the resumed turn —
+                # its stream edits, the batch's next question, the final flush — all read the new
+                # surface. A failed migration keeps the old one rather than losing the reply.
+                await self._migrate_guest_surface(chat_id_str, guest_query_id)
+                logger.info(
+                    "[%s] Guest clarify continuation routed into the in-flight turn (chat=%s)",
+                    self.name, chat_id_str)
+                self._enqueue_text_event(self._apply_telegram_group_observe_attribution(_continuation))
+                return
+
+        # Guest state (_pending_guest_queries, _guest_reply_buffer,
+        # _guest_inline_message_ids) is keyed by chat_id, not guest_query_id —
+        # a second @mention from the same chat while a turn is still in flight
+        # would otherwise overwrite the first turn's query id and reset its
+        # stub sentinel, orphaning the first stub and letting the two replies'
+        # buffered text cross-contaminate. Reject the new query outright with
+        # its own immediate answer instead of touching in-flight state.
+        if chat_id_str in self._pending_guest_queries:
+            await self._answer_guest_query(
+                guest_query_id,
+                InlineQueryResultArticle(
+                    id="busy", title="Still working on the previous request",
+                    input_message_content=InputTextMessageContent(
+                        "⏳ Still working on a previous request in this chat — please wait for that reply, then ask again."),
+                ),
+                log_label="busy-reply",
+            )
+            return
+
+        # Register state, fire stub, route to skill layer.
+        self._pending_guest_queries[chat_id_str] = guest_query_id
+        self._guest_only_chats.add(chat_id_str)
+        # Remembered for button taps: an inline-message callback carries no chat, and the tap must
+        # be authorized against the same (user, chat, chat_type) tuple this message was gated on.
+        self._guest_chat_types[chat_id_str] = str(_guest_chat_type or "group")
+        self._known_guest_chats[chat_id_str] = time.time()
+        while len(self._known_guest_chats) > self._GUEST_INLINE_MAP_MAX:
+            self._known_guest_chats.pop(next(iter(self._known_guest_chats)), None)
+
+        if not self._should_process_message(msg):
+            self._pending_guest_queries.pop(chat_id_str, None)
+            self._guest_only_chats.discard(chat_id_str)
+            return
+
+        # Sentinel: False = slot open, stub not fired yet.
+        # None = stub fired, Telegram returned no imi.  str = real imi.
+        self._guest_inline_message_ids[chat_id_str] = False
+
+        if _media_group_id and has_media:
+            self._guest_media_group_ids[chat_id_str] = _media_group_id
+
+        event = self._build_message_event(
+            msg, self._media_message_type(msg) if has_media else MessageType.TEXT,
+            update_id=update.update_id)
+        event.text = self._clean_bot_trigger_text(event.text)
+
+        # Session isolation per guest caller falls out of _build_message_event for
+        # free now: it reads user_id/user_name straight off msg.from_user, which is
+        # exactly _guest_caller_id's source above. build_session_key groups group
+        # participants by user_id, so this alone gives guest turns the same
+        # per-caller session keying ordinary group messages already get —
+        # per-caller when group_sessions_per_user is on (the default), shared only
+        # if the operator deliberately turned that off.
+
+        # Inject delivery constraint so the LLM knows direct Bot API calls to this
+        # chat will fail (bot is not a member).
+        _guest_delivery_note = (
+            "**Delivery constraint (this session only):** You are responding to "
+            "a @mention in a group chat where the bot is not a member. "
+            "Direct Bot API calls (sendVideo, sendPhoto, sendDocument, sendAudio, "
+            "curl to api.telegram.org, etc.) to this chat will fail with "
+            "\"Forbidden: bot is not a member\" — do NOT attempt them.\n"
+            "Attachments DO work through the normal channel: write the file under "
+            f"`{self._guest_media_staging_hint()}` and attach it with a `MEDIA:<path>` "
+            "directive as usual. The gateway stages it and the reply carries a button "
+            "the asker taps to receive it in this chat. Files written anywhere else are "
+            "refused, so always stage under that directory."
+        )
+        if event.channel_prompt:
+            event.channel_prompt = event.channel_prompt + "\n\n" + _guest_delivery_note
+        else:
+            event.channel_prompt = _guest_delivery_note
+
+        # Slash commands aren't routed in guest context: command handlers fire
+        # their own answerGuestQuery which creates a second orphaned stub, leaving
+        # an unupdated "⏳" message and a separate "⚠️ Sorry..." reply.
+        # Block them early and reply directly so the user knows why.
+        if event.text.lstrip().startswith("/"):
+            self._pending_guest_queries.pop(chat_id_str, None)
+            self._guest_inline_message_ids.pop(chat_id_str, None)
+            self._guest_only_chats.discard(chat_id_str)
+            await self._answer_guest_query(
+                guest_query_id,
+                InlineQueryResultArticle(
+                    id="reply", title="Commands not supported",
+                    input_message_content=InputTextMessageContent(
+                        "📋 Slash commands aren't supported in this context — just ask me a question!"),
+                ),
+                log_label="slash-block reply",
+            )
+            return
+
+        if has_media:
+            # Downloading and caching an attachment (and running vision/STT over it) takes
+            # seconds, and the text path only fires the stub once send_typing lands. Fire it
+            # here so the caller sees the ⏳ straight away instead of silence.
+            await self._guest_fire_text_stub(chat_id_str)
+            await self._cache_and_route_media(msg, event)
+            return
+
+        # Media on the message this one replies to. The member text path picks it up inside
+        # _build_triggered_event; the guest path open-codes the event build (it cleans the trigger
+        # text differently) and dropped this hop, so "@bot what do you hear?" sent as a reply to
+        # someone's video reached the model as a bare quoted line with no file at all — while the
+        # same video attached to the mention itself analysed fine.
+        _reply_msg = getattr(msg, "reply_to_message", None)
+        if _reply_msg is not None:
+            _replied_source = self._observed_media_source(_reply_msg)[0]
+            # One line per guest reply: without it the next occurrence of this class of bug is
+            # again indistinguishable between "Telegram sent no media", "we never looked" and
+            # "the download failed" (the last two log their own lines below).
+            logger.info(
+                "[%s] Guest reply context (chat=%s replied_media=%s)",
+                self.name, chat_id_str, _replied_source is not None)
+            if _replied_source is not None:
+                # Same reason as the has_media branch above: the download and whatever runs over
+                # it take seconds, and on the text path the stub otherwise waits for send_typing.
+                # _guest_fire_text_stub is idempotent, so the later firing becomes a no-op.
+                await self._guest_fire_text_stub(chat_id_str)
+                # Gated on there being something to fetch: a reply to plain text keeps the
+                # timing it has today, with no download attempt behind it.
+                await self._cache_replied_media(msg, event)
+
+        event = self._apply_telegram_group_observe_attribution(event)
+        self._enqueue_text_event(event)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
+        self._note_member_chat(update)
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -6006,6 +7578,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        self._note_member_chat(update)
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -6303,6 +7876,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        self._note_member_chat(update)
         msg = update.message
         if not msg:
             return
@@ -6321,6 +7895,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.caption:
             from plugins.platforms.telegram.telegram_context import group_trigger_text
             event.text = group_trigger_text(self, msg, expand_link_entities(msg))
+        await self._cache_and_route_media(msg, event)
+
+    async def _cache_and_route_media(self, msg, event: MessageEvent) -> None:
+        """Cache ``msg``'s attachment into ``event`` and dispatch it.
+
+        Shared by the member path above and the guest path (``_handle_guest_message_update``),
+        so an image or a file dropped into a guest chat gets the same vision/STT/document
+        treatment a DM gets — only the reply's last hop differs.
+        """
         # Stickers: _handle_sticker overwrites event.text with its vision description, so observe attribution must run after it.
         if msg.sticker:
             await self._handle_sticker(msg, event)
@@ -6671,6 +8254,121 @@ class TelegramAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
         replaces, not adds); CANCELLED explicitly clears the 👀."""
+        # Guest mode OPC (Bot API 10.0): edit the stub with the final text reply, and
+        # offer whatever attachments the turn staged as deliver_<token> buttons.
+        self._ensure_guest_state()
+        _gc_id = str(getattr(event.source, "chat_id", None) or "")
+        if _gc_id:
+            _guest_qid = self._pending_guest_queries.pop(_gc_id, None)
+            # Sentinel semantics for _guest_inline_message_ids:
+            #   False  → stub never fired (shouldn't happen — send_typing always fires it)
+            #   None   → stub fired but Telegram returned no inline_message_id
+            #   str    → stub fired, real imi for editMessageText
+            _guest_imi_raw = self._guest_inline_message_ids.pop(_gc_id, False)
+            _guest_imi = _guest_imi_raw if isinstance(_guest_imi_raw, str) else None
+            _buffered = self._guest_reply_buffer.pop(_gc_id, "")
+            # Attachments staged during the turn (MEDIA: directives routed through
+            # _guest_media_send). A guest bot cannot push a file into a chat it hasn't
+            # joined, so the reply carries a button per file instead; tapping it sends
+            # deliver_<token> back and that query is answered with the cached media.
+            # Captured before the flush so a question drawn while it runs (a late clarify on
+            # another thread) is not overwritten by what is, by then, a stale final answer.
+            _guest_gen = self._guest_surface_generation(_gc_id)
+            self._guest_answered_lines.pop(_gc_id, None)
+            self._guest_prompt_undeliverable.discard(_gc_id)
+            _guest_media_all = self._guest_turn_media_all.pop(_gc_id, None) or []
+            _guest_media_latest = self._guest_turn_media.pop(_gc_id, None)
+            if not _guest_media_all and _guest_media_latest:
+                _guest_media_all = [_guest_media_latest]
+            self._guest_media_group_ids.pop(_gc_id, None)
+            self._guest_only_chats.discard(_gc_id)
+            # ``_guest_surface_moved``: a question drawn while this flush was being prepared is
+            # still unanswered, and overwriting it with what is by then a stale final answer is the
+            # lost update this guard exists to stop. It logs its own reason when it fires.
+            if (_guest_qid or _guest_imi) and self._bot and not self._guest_surface_moved(_gc_id, _guest_gen):
+                _plain = _strip_mdv2(self.format_message(_buffered)).strip() if _buffered else ""
+                # Strip any leading MEDIA artifact that escaped stream-consumer cleanup.
+                _plain = re.sub(r"(?i)^MEDIA:?\s*\S*\s*", "", _plain).strip()
+                # UTF-16 code units, not Python string length — Telegram's 4,096
+                # limit is measured in UTF-16 units, so a naive _plain[:4096]
+                # slice can pass this check while still exceeding the real cap
+                # (e.g. 2,049 emoji is 2,049 chars but 4,098 UTF-16 units) and
+                # fail the editMessageText call below, after guest state has
+                # already been torn down above — silently dropping the turn.
+                # Only the edit path needs buttons; the no-imi path below still holds an
+                # unspent query and answers with the file itself, so don't mint a token for it.
+                _guest_markup, _guest_hint = (
+                    self._guest_media_keyboard(_guest_media_all) if (_guest_imi and _guest_media_all)
+                    else (None, ""))
+                _reply_text = self._truncate_stream_overflow_preview(_plain) or (
+                    "" if _guest_markup is not None else "⚠️ Sorry, something went wrong. Please try again.")
+                if _guest_markup is not None:
+                    # Always spell out what the buttons are for: with no prose at all the
+                    # message would otherwise be a bare button with no explanation.
+                    _reply_text = self._truncate_stream_overflow_preview(
+                        f"{_reply_text}\n\n{_guest_hint}".strip())
+                logger.warning("[%s] guest OPC flush (chat=%s buffered_len=%d imi=%s)",
+                               self.name, _gc_id, len(_buffered), _guest_imi)
+                try:
+                    if _guest_imi and _guest_markup is not None:
+                        # Attachment result: one edit, no typewriter — the buttons are the
+                        # point of the message and animating text under them just delays
+                        # the tap. reply_markup on an inline message needs no chat membership.
+                        await self._bot.edit_message_text(
+                            text=_reply_text, inline_message_id=_guest_imi, reply_markup=_guest_markup)
+                        logger.info(
+                            "[%s] guest OPC media edit (chat=%s imi=%s files=%d)",
+                            self.name, _gc_id, _guest_imi, len(_guest_media_all))
+                    elif _guest_imi:
+                        # Text result: typewriter then final edit.  Animate over
+                        # the already-truncated _reply_text, not raw _plain —
+                        # otherwise a long _plain both risks an oversized
+                        # mid-animation frame (same UTF-16 issue as above) and
+                        # makes the display visibly "shrink" on the final edit
+                        # when _plain is longer than the truncated _reply_text.
+                        _tw_min = 80
+                        _tw_frames = 8
+                        _tw_delay = 0.4
+                        if len(_reply_text) >= _tw_min:
+                            _tw_chunk = max(40, len(_reply_text) // _tw_frames)
+                            _tw_pos = _tw_chunk
+                            while _tw_pos < len(_reply_text):
+                                _tw_frame = _reply_text[:_tw_pos]
+                                _tw_break = max(_tw_frame.rfind('\n'), _tw_frame.rfind(' '))
+                                if _tw_break > 0:
+                                    _tw_frame = _tw_frame[:_tw_break]
+                                try:
+                                    await self._bot.edit_message_text(text=_tw_frame, inline_message_id=_guest_imi)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(_tw_delay)
+                                _tw_pos += _tw_chunk
+                        await self._bot.edit_message_text(text=_reply_text, inline_message_id=_guest_imi)
+                        logger.warning("[%s] guest OPC text edit (chat=%s imi=%s)", self.name, _gc_id, _guest_imi)
+                    elif _guest_qid and _guest_media_all:
+                        # No imi, but the query was never spent: answer it with the file
+                        # itself — better than a button, since this is a live one-shot slot.
+                        _direct = dict(_guest_media_all[0])
+                        _direct["caption"] = (_plain or None) and _plain[:1024]
+                        await self._answer_guest_query(
+                            _guest_qid, self._guest_cached_media_result(_direct, result_id="reply"),
+                            log_label="OPC media reply")
+                        logger.info("[%s] guest OPC direct media reply (chat=%s no_imi)", self.name, _gc_id)
+                    elif _guest_qid:
+                        # No imi (the stub call itself raised) — fall back to a fresh answerGuestQuery.
+                        _fallback = "⛔ Not authorized." if not _buffered else _reply_text
+                        await self._answer_guest_query(
+                            _guest_qid,
+                            InlineQueryResultArticle(
+                                id="reply", title="Reply",
+                                input_message_content=InputTextMessageContent(_fallback),
+                            ),
+                            log_label="OPC fallback reply",
+                        )
+                        logger.warning("[%s] guest OPC fallback reply (chat=%s no_imi)", self.name, _gc_id)
+                except Exception as _flush_err:
+                    logger.error("[%s] guest OPC flush failed (chat=%s): %s", self.name, _gc_id, _flush_err)
+
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)

@@ -1119,6 +1119,82 @@ With `guest_mode: true`, a message from a non-allowlisted group is processed **o
 
 DMs and allowlisted groups behave exactly as before.
 
+### Guest bots: chats the bot never joined (Bot API 10.0)
+
+`guest_mode` also switches on Telegram's **guest bot** replies. Telegram delivers an @mention
+from a chat the bot is *not a member of* as a `guest_message` carrying a one-shot
+`guest_query_id`; Hermes answers it with a "⏳ Thinking…" placeholder, then edits that same
+message in place as the answer streams in. The bot never joins the chat and can see nothing
+but the messages that address it.
+
+**Who may use it.** Guest mode opens the bot to any chat that knows its @handle, so the caller
+— not just the chat — is authorized before anything runs, against the same allowlist the
+approval buttons use (`TELEGRAM_ALLOWED_USERS` / the group variants / `GATEWAY_ALLOWED_USERS`,
+unioned with the pairing store, `*` to open it to everyone). An empty allowlist or an
+unrecognized caller is denied, and the denial is logged with the caller id. Sessions are keyed
+per caller exactly as they are for ordinary group messages.
+
+**Attachments.** Images and files work in both directions:
+
+- **Inbound** — a photo, voice note, video or document sent with the @mention takes the same
+  caching path a DM takes, so vision, transcription and document reading all behave as usual.
+  Albums arrive as one request.
+- **Outbound** — a `MEDIA:<path>` attachment can't be pushed into a chat the bot hasn't joined,
+  so Hermes uploads the file once to your **home channel** to mint a `file_id` and puts a button
+  on the reply. The asker taps it and receives the file in the chat. Only files written under
+  `HERMES_HOME/cache` can be staged this way; anything else is refused before it is read.
+
+The staging channel defaults to your configured home channel (`TELEGRAM_HOME_CHANNEL`).
+Point it somewhere else with:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_staging_chat: "-1009876543210"   # bot must be a member; default: home channel
+```
+
+Env equivalent: `TELEGRAM_GUEST_STAGING_CHAT`. Without a staging chat configured, guest replies
+stay text-only and attachments are refused with a log line rather than failing the turn.
+
+Delivery tokens behind the buttons are single-use, expire after 15 minutes, and are re-checked
+against the caller allowlist when redeemed, so a token read over someone's shoulder is useless
+to them.
+
+The button pre-fills `@yourbot deliver_<token>` in the asker's input box; sending it is what
+fetches the file. Enabling inline mode for the bot (BotFather → `/setinline`) makes that a single
+tap, and the same payload is then answered as an inline result too.
+
+**Prompts that need an answer.** A clarify question, an exec approval or a `/model`-style picker
+cannot be posted as a new message either, so it is drawn on that same inline message — text and
+inline keyboard together — and tapping a button edits it in place: first to the outcome of the tap,
+then to the final reply when the turn finishes. Taps are authorized against the same allowlist as
+the @mention that started the turn, and a tap that can no longer be traced back to its chat (after a
+gateway restart, say) is refused rather than evaluated without context. If there is no inline message
+to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
+answer to a question nobody could see.
+
+**Several questions at once.** The agent can ask a batch. A guest chat has only that one message
+to work with, so the batch walks through it: each question replaces the last, with the answers
+given so far kept above it, and only the question currently being waited on carries a keyboard.
+Writes to that message are ordered — a late "you answered X" can never land on top of the next
+question and take its buttons with it.
+
+**Typed answers.** Tapping `✏️ Other`, or answering an open-ended question, means typing into the
+chat while the turn is still running. That message is recognised as the answer the turn is waiting
+for and routed into it, so the turn resumes — and the reply moves with it: the bot answers your
+message, and everything after that (the rest of the reply, the batch's next question) is written
+there rather than in the card further up. The card you answered keeps whatever it last showed, as
+the record of where the interaction stood. A button tap creates no message, so a tapped answer
+stays in the card it was tapped on, exactly as before. Anything the prompt would not accept as an answer — a slash command, an
+attachment, an unrelated question while the buttons are still up — gets the usual "still working on
+a previous request" reply instead, so nothing is silently swallowed.
+
+Slash commands are not routed in guest chats — each command would consume a second reply slot —
+so the bot answers those with a short note instead.
+
 ## Slash Command Access Control
 
 By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the platform's `extra` block:
