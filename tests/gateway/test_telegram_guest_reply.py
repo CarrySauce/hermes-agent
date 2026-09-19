@@ -144,8 +144,7 @@ def _make_adapter() -> TelegramAdapter:
 
 def _register_guest_chat(adapter: TelegramAdapter, chat_id="42") -> None:
     """Pre-populate state as if branch-1 processing started."""
-    adapter._pending_guest_queries[chat_id] = "gqid_test"
-    adapter._guest_only_chats.add(chat_id)
+    adapter._register_guest_turn(chat_id, chat_id, "gqid_test")
     adapter._guest_inline_message_ids[chat_id] = False
 
 
@@ -304,7 +303,7 @@ async def test_branch1_opc_no_imi_falls_back_to_answer_guest_query():
     from gateway.platforms.base import ProcessingOutcome
 
     adapter = _make_adapter()
-    adapter._pending_guest_queries["42"] = "gqid_fallback"
+    adapter._register_guest_turn("42", "42", "gqid_fallback")
     adapter._guest_inline_message_ids["42"] = None  # stub raised
     adapter._guest_reply_buffer["42"] = "Fallback answer."
     adapter._guest_only_chats.add("42")
@@ -815,8 +814,7 @@ async def test_guest_caption_less_document_is_not_dropped_as_empty():
 async def test_guest_album_continuation_merges_instead_of_busy_reply():
     """An album is one request: its 2nd..Nth guest messages join the in-flight turn."""
     adapter = _make_adapter()
-    adapter._pending_guest_queries["42"] = "gq_first"
-    adapter._guest_only_chats.add("42")
+    adapter._register_guest_turn("42", "42", "gq_first")
     adapter._guest_media_group_ids["42"] = "album1"
     update, msg = _make_guest_media_update(
         kind="photo", caption=None, gqid="gq_second", media_group_id="album1", update_id=12)
@@ -836,8 +834,7 @@ async def test_guest_album_continuation_merges_instead_of_busy_reply():
 async def test_guest_second_unrelated_message_still_gets_the_busy_reply():
     """The album exemption is narrow: an unrelated second ask is still rejected."""
     adapter = _make_adapter()
-    adapter._pending_guest_queries["42"] = "gq_first"
-    adapter._guest_only_chats.add("42")
+    adapter._register_guest_turn("42", "42", "gq_first")
     update, msg = _make_guest_update(update_id=13, gqid="gq_second", text="@testbot another one")
 
     with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
@@ -952,7 +949,7 @@ async def test_opc_without_imi_answers_with_the_media_itself():
     from gateway.platforms.base import ProcessingOutcome
 
     adapter = _make_adapter()
-    adapter._pending_guest_queries["42"] = "gq_live"
+    adapter._register_guest_turn("42", "42", "gq_live")
     adapter._guest_inline_message_ids["42"] = None  # stub fired, Telegram returned no imi
     adapter._guest_reply_buffer["42"] = "Here is the chart."
     adapter._guest_turn_media["42"] = {"file_id": "fid_chart", "media_kind": "photo", "file_name": "chart.png"}
@@ -2024,8 +2021,8 @@ async def _guest_turn(adapter, *, text, reply_to=None, update_id, gqid="gq_threa
          patch.object(adapter, "_enqueue_text_event", side_effect=lambda e: captured.update(event=e)):
         await adapter._handle_guest_message_update(update, MagicMock())
     # The turn owns the chat until OPC; release it so the next mention isn't the busy reply.
-    adapter._pending_guest_queries.pop("42", None)
-    adapter._guest_only_chats.discard("42")
+    for _live in adapter._guest_live_turn_keys("42"):
+        adapter._release_guest_turn(_live)
     return captured.get("event")
 
 
@@ -2064,7 +2061,7 @@ async def test_replying_to_the_bot_continues_that_thread():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot remember the number 7", reply_to=None, update_id=104)
-    adapter._remember_guest_surface_thread("42", "imi_abc", "Noted — the number is 7.")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_abc", "Noted — the number is 7.")
 
     follow_up = await _guest_turn(
         adapter, text="@testbot what was it?", reply_to=_bot_message("Noted — the number is 7."),
@@ -2081,9 +2078,9 @@ async def test_a_reply_picks_the_thread_it_points_at_not_the_newest():
     adapter = _thread_adapter()
 
     older = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=106)
-    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(older.source.thread_id, "imi_a", "About A: …")
     newer = await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=107)
-    adapter._remember_guest_surface_thread("42", "imi_b", "About B: …")
+    adapter._remember_guest_surface_thread(newer.source.thread_id, "imi_b", "About B: …")
 
     back_to_a = await _guest_turn(
         adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=600),
@@ -2099,7 +2096,7 @@ async def test_replying_to_someone_else_starts_a_new_thread():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=109)
-    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
 
     unrelated = await _guest_turn(
         adapter, text="@testbot what about this?", reply_to=_other_users_message(), update_id=110)
@@ -2128,7 +2125,7 @@ async def test_the_message_id_memo_survives_an_edited_quote():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=113)
-    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
     await _guest_turn(
         adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=700),
         update_id=114)
@@ -2149,10 +2146,12 @@ async def test_the_final_answer_binds_the_thread_it_was_written_in():
 
     adapter = _thread_adapter()
     first = await _guest_turn(adapter, text="@testbot remember 7", reply_to=None, update_id=117)
-    adapter._guest_inline_message_ids["42"] = "imi_abc"
-    adapter._guest_reply_buffer["42"] = "Noted — the number is 7."
+    adapter._guest_inline_message_ids[first.source.thread_id] = "imi_abc"
+    adapter._guest_reply_buffer[first.source.thread_id] = "Noted — the number is 7."
+    adapter._register_guest_turn("42", first.source.thread_id, "gqid_flush")
     event = MagicMock()
     event.source.chat_id = "42"
+    event.source.thread_id = first.source.thread_id
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=118)
 
@@ -2176,9 +2175,8 @@ async def test_a_typed_clarify_answer_stays_in_the_turns_thread(monkeypatch):
     live_thread = first.source.thread_id
 
     # The turn is in flight and waiting on an open-ended clarify keyed to ITS session.
-    adapter._pending_guest_queries["42"] = "gqid_test"
-    adapter._guest_only_chats.add("42")
-    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    adapter._register_guest_turn("42", live_thread, "gqid_test")
+    adapter._guest_inline_message_ids[live_thread] = "imi_abc"
     session_key = _session_key(adapter, first)
     monkeypatch.setattr(adapter, "_gateway_session_key", lambda event: session_key)
     clarify_gateway.register("c1", session_key, "Which day?", None)
@@ -2202,3 +2200,180 @@ async def test_two_callers_keep_separate_sessions_in_one_thread_chat():
 
     assert "111" in mine.source.thread_id and "222" in theirs.source.thread_id
     assert _session_key(adapter, mine) != _session_key(adapter, theirs)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent guest turns
+#
+# Per-turn state used to be keyed by chat, so a second unrelated @mention was
+# refused by a chat-wide busy guard: one conversation at a time per chat. The key
+# is now the turn (its thread token, or the chat id when the feature is off), so
+# two conversations run side by side with a surface each.
+# ---------------------------------------------------------------------------
+
+async def _guest_turn_live(adapter, *, text, update_id, gqid, reply_to=None, caller_id="999"):
+    """Route a mention and leave its turn in flight (no OPC), returning its event."""
+    update, msg = _make_guest_update(update_id=update_id, gqid=gqid, text=text, caller_id=caller_id)
+    msg.reply_to_message = reply_to
+    captured = {}
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_apply_telegram_group_observe_attribution", side_effect=lambda e: e), \
+         patch.object(adapter, "_enqueue_text_event", side_effect=lambda e: captured.update(event=e)):
+        await adapter._handle_guest_message_update(update, MagicMock())
+    return captured.get("event")
+
+
+@pytest.mark.asyncio
+async def test_two_unrelated_mentions_run_as_two_turns():
+    """The reported failure: the second mention was refused instead of starting its own turn."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=201, gqid="gq_a")
+    second = await _guest_turn_live(adapter, text="@testbot topic B", update_id=202, gqid="gq_b")
+
+    assert first is not None and second is not None
+    ta, tb = first.source.thread_id, second.source.thread_id
+    assert ta != tb
+    # Each turn holds its own query id and its own surface slot.
+    assert adapter._pending_guest_queries == {ta: "gq_a", tb: "gq_b"}
+    assert adapter._guest_inline_message_ids == {ta: False, tb: False}
+    assert adapter._guest_live_turn_keys("42") == [ta, tb]
+    # Neither's streamed text lands on the other's message.
+    await adapter.send("42", "answer for A", metadata={"thread_id": ta, "expect_edits": True})
+    await adapter.send("42", "answer for B", metadata={"thread_id": tb, "expect_edits": True})
+    assert adapter._guest_reply_buffer[ta] == "answer for A"
+    assert adapter._guest_reply_buffer[tb] == "answer for B"
+
+
+@pytest.mark.asyncio
+async def test_a_second_message_in_the_same_thread_still_gets_the_busy_reply():
+    """Two turns in ONE conversation would fight over one surface — that is what the guard is for."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=203, gqid="gq_a")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+
+    again = await _guest_turn_live(
+        adapter, text="@testbot and also this", update_id=204, gqid="gq_a2",
+        reply_to=_bot_message("About A: …", message_id=800))
+
+    assert again is None
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+    assert adapter._pending_guest_queries[first.source.thread_id] == "gq_a"
+
+
+@pytest.mark.asyncio
+async def test_opc_for_one_turn_leaves_the_other_running():
+    """A chat stops being a guest chat only when its LAST turn ends."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter = _thread_adapter()
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=205, gqid="gq_a")
+    second = await _guest_turn_live(adapter, text="@testbot topic B", update_id=206, gqid="gq_b")
+    ta, tb = first.source.thread_id, second.source.thread_id
+    adapter._guest_inline_message_ids[ta] = "imi_a"
+    adapter._guest_inline_message_ids[tb] = "imi_b"
+    adapter._guest_reply_buffer[ta] = "A is done."
+    adapter._guest_reply_buffer[tb] = "B is still writing."
+
+    event = MagicMock()
+    event.source.chat_id = "42"
+    event.source.thread_id = ta
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    # A flushed to its own message…
+    assert adapter._bot.edit_message_text.await_args.kwargs["inline_message_id"] == "imi_a"
+    assert adapter._bot.edit_message_text.await_args.kwargs["text"] == "A is done."
+    # …and B is untouched and still live.
+    assert adapter._pending_guest_queries == {tb: "gq_b"}
+    assert adapter._guest_reply_buffer[tb] == "B is still writing."
+    assert adapter._guest_live_turn_keys("42") == [tb]
+    assert adapter._is_guest_chat("42") is True
+
+
+@pytest.mark.asyncio
+async def test_a_tap_resolves_to_the_turn_whose_surface_it_happened_on():
+    """A tap carries only its inline message, which is exactly what identifies its conversation."""
+    adapter = _thread_adapter()
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=207, gqid="gq_a")
+    second = await _guest_turn_live(adapter, text="@testbot topic B", update_id=208, gqid="gq_b")
+    ta, tb = first.source.thread_id, second.source.thread_id
+    adapter._guest_chat_types["42"] = "supergroup"
+    adapter._remember_guest_inline_message("42", "imi_a")
+    adapter._remember_guest_inline_message("42", "imi_b")
+    adapter._remember_guest_surface_thread(ta, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(tb, "imi_b", "About B: …")
+
+    assert adapter._callback_ctx(_tap(adapter, data="cl:x:0", imi="imi_a"))["guest_turn_key"] == ta
+    assert adapter._callback_ctx(_tap(adapter, data="cl:x:0", imi="imi_b"))["guest_turn_key"] == tb
+
+
+@pytest.mark.asyncio
+async def test_each_turn_stages_its_own_attachment(tmp_path, monkeypatch):
+    """The deliver button offered at the end of a turn must carry that turn's file."""
+    path = _staged_file(tmp_path, monkeypatch, name="a.png", data=b"a")
+    adapter = _thread_adapter()
+    adapter._bot.send_photo = AsyncMock(return_value=MagicMock(photo=[MagicMock(file_id="fid_a")]))
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=209, gqid="gq_a")
+    await _guest_turn_live(adapter, text="@testbot topic B", update_id=210, gqid="gq_b")
+
+    result = await adapter.send_image_file(
+        "42", str(path), metadata={"thread_id": first.source.thread_id})
+
+    assert result.success is True
+    assert list(adapter._guest_turn_media) == [first.source.thread_id]
+
+
+@pytest.mark.asyncio
+async def test_the_ladder_refuses_rather_than_writing_to_the_wrong_surface():
+    """With two conversations live and nothing saying which, a guess is worse than a failure."""
+    adapter = _thread_adapter()
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=211, gqid="gq_a")
+
+    # One turn in flight: a send with no thread resolves to it (the sole-in-flight rung).
+    assert adapter._guest_turn_key(chat_id="42") == first.source.thread_id
+    result = await adapter.send("42", "A's answer", metadata={"expect_edits": True})
+    assert result.success is True
+
+    await _guest_turn_live(adapter, text="@testbot topic B", update_id=212, gqid="gq_b")
+
+    # Two in flight and no identifier: refuse, and say so.
+    assert adapter._guest_turn_key(chat_id="42") is None
+    ambiguous = await adapter.send("42", "which one?", metadata={"expect_edits": True})
+    assert ambiguous.success is False
+    assert ambiguous.error == "guest_turn_unresolved"
+    # An explicit thread still resolves, and a surface resolves without one.
+    assert adapter._guest_turn_key(chat_id="42", metadata={"thread_id": "g7u1"}) == "g7u1"
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+    assert adapter._guest_turn_key(chat_id="42", inline_message_id="imi_a") == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_the_concurrency_ceiling_refuses_the_excess_mention():
+    """Unbounded fan-out in a group chat is a way to exhaust the agent."""
+    adapter = _thread_adapter()
+    for index in range(adapter._GUEST_MAX_CONCURRENT_TURNS):
+        assert await _guest_turn_live(
+            adapter, text=f"@testbot topic {index}", update_id=220 + index, gqid=f"gq{index}") is not None
+
+    refused = await _guest_turn_live(adapter, text="@testbot one more", update_id=230, gqid="gq_over")
+
+    assert refused is None
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+    assert len(adapter._guest_live_turn_keys("42")) == adapter._GUEST_MAX_CONCURRENT_TURNS
+
+
+@pytest.mark.asyncio
+async def test_with_the_feature_off_the_guard_stays_chat_wide():
+    """Off, the turn key IS the chat id: one conversation at a time, exactly as before."""
+    adapter = _thread_adapter(enabled=False)
+
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=240, gqid="gq_a")
+    second = await _guest_turn_live(adapter, text="@testbot topic B", update_id=241, gqid="gq_b")
+
+    assert first is not None and first.source.thread_id is None
+    assert second is None
+    assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
+    assert adapter._pending_guest_queries == {"42": "gq_a"}
+    assert adapter._guest_turn_key(chat_id="42") == "42"

@@ -1200,8 +1200,14 @@ conversations either way — they belong to the turn that is waiting for them.
 
 A guest chat has no Telegram threads of its own (every bot message is a standalone inline message),
 so the thread a reply belongs to is recognised from the text the reply quotes back, remembered per
-message. A reply the bot cannot place — to a message from before it restarted, say — continues the
-chat's most recent conversation rather than starting over.
+message. Those bindings live in memory: after a gateway restart a reply to one of the bot's older
+messages can no longer be placed, and starts a new conversation instead. A reply the bot cannot
+place for any other reason continues the chat's most recent conversation rather than starting over.
+
+Conversations also run **side by side**. Two unrelated mentions both get an answer, each on its own
+message, rather than the second being told to wait — that only happens when a second message lands
+in a conversation that is still working, where the two really would fight over one message. At most
+three conversations run at once per chat; a mention past that gets the "still working" reply.
 
 **Several questions at once.** The agent can ask a batch. A guest chat has only that one message
 to work with, so the batch walks through it: each question replaces the last, with the answers
