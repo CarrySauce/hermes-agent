@@ -1358,6 +1358,7 @@ platform_toolsets:
 #     extra:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       guest_staging_chat: ""        # guest_mode attachments are uploaded here to mint a file_id; default: home channel
+#       guest_thread_sessions: false  # guest_mode: one session per conversation thread (a reply to the bot continues that thread; a bare @mention starts a new one)
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames
 #       allow_cjk_rich_messages: false # Keep CJK content on the safe MarkdownV2 path unless an unaffected client explicitly opts in to native rich rendering

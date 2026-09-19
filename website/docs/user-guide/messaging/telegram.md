@@ -1176,6 +1176,33 @@ gateway restart, say) is refused rather than evaluated without context. If there
 to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
 answer to a question nobody could see.
 
+**One session per thread (`guest_thread_sessions`).** By default a guest chat has one session per
+caller, so every mention continues the same conversation. Turn this on and the chat behaves as if it
+had threads:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_thread_sessions: true   # default false
+```
+
+Env equivalent: `TELEGRAM_GUEST_THREAD_SESSIONS=true`. Guest mode only, and opt-in because switching
+it on changes how session keys are built — the guest sessions a chat already has are left behind by
+the change.
+
+With it on: a plain `@mention` starts a **new** conversation, with none of the earlier context.
+**Replying** to one of the bot's messages continues *that* conversation, including an older one the
+chat has since moved past. Button taps and typed answers to a question the bot asked are not new
+conversations either way — they belong to the turn that is waiting for them.
+
+A guest chat has no Telegram threads of its own (every bot message is a standalone inline message),
+so the thread a reply belongs to is recognised from the text the reply quotes back, remembered per
+message. A reply the bot cannot place — to a message from before it restarted, say — continues the
+chat's most recent conversation rather than starting over.
+
 **Several questions at once.** The agent can ask a batch. A guest chat has only that one message
 to work with, so the batch walks through it: each question replaces the last, with the answers
 given so far kept above it, and only the question currently being waited on carries a keyboard.

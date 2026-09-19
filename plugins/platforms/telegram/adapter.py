@@ -566,6 +566,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # Chats only ever reached as a guest. Outlives the turn so an advisory send that lands
         # between turns is refused cleanly instead of spending a request on a certain "Forbidden".
         self._known_guest_chats: Dict[str, float] = {}
+        # Guest conversation threads (opt-in, see _telegram_guest_thread_sessions). A fresh
+        # @mention starts a thread; replying to one of the bot's messages continues that thread's
+        # session. All four maps outlive the turn — a reply can arrive an hour later — and are
+        # bounded together in _trim_guest_thread_maps.
+        self._guest_thread_seq: int = 0
+        self._guest_current_threads: Dict[str, str] = {}   # chat_id → live thread token
+        self._guest_thread_by_surface: Dict[str, str] = {}  # inline_message_id → thread token
+        self._guest_thread_by_text: Dict[str, str] = {}     # normalized bot text → thread token
+        self._guest_thread_by_reply_id: Dict[str, str] = {}  # "chat:message_id" → thread token
         # chat_id → generation of the one inline message that chat has. Bumped by every question
         # drawn on it; a write that captured an older generation is dropped rather than allowed to
         # clobber a newer one (see _guest_surface_write_is_stale).
@@ -1118,9 +1127,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
+        """Telegram ``message_thread_id`` for *thread_id*, or None when it is not a topic id.
+
+        A session's thread id is not always a forum topic: guest thread sessions key on a
+        synthetic token, and only Telegram's own numeric ids can route a send. Anything
+        non-numeric means "no topic lane", which is the honest answer — raising here would turn a
+        deliverable message into a failed send on a chat that has no topics in the first place.
+        """
         if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
             return None
-        return int(thread_id)
+        try:
+            return int(thread_id)
+        except (TypeError, ValueError):
+            logger.debug("Non-numeric thread id %r is not a Telegram topic; sending unrouted", thread_id)
+            return None
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -5735,6 +5755,15 @@ class TelegramAdapter(BasePlatformAdapter):
             "observe_unmentioned_group_messages", "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false",
             "ingest_unmentioned_group_messages")
 
+    def _telegram_guest_thread_sessions(self) -> bool:
+        """Whether a guest chat gets one session per conversation thread instead of one per chat.
+
+        Guest-mode only, opt-in: turning it on changes how session keys are built, so existing
+        guest sessions in a chat would otherwise be orphaned by a deploy. Off = today's behavior,
+        byte for byte (no thread component is ever set).
+        """
+        return self._extra_bool("guest_thread_sessions", "TELEGRAM_GUEST_THREAD_SESSIONS", "false")
+
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
         return self._extra_bool("guest_mode", "TELEGRAM_GUEST_MODE", "false")
@@ -5747,6 +5776,9 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_staged_file_ids", dict), ("_guest_media_group_ids", dict),
         ("_guest_chat_types", dict), ("_guest_inline_chats", dict), ("_guest_prompt_texts", dict),
         ("_known_guest_chats", dict), ("_guest_surface_generations", dict),
+        ("_guest_thread_seq", int), ("_guest_current_threads", dict),
+        ("_guest_thread_by_surface", dict), ("_guest_thread_by_text", dict),
+        ("_guest_thread_by_reply_id", dict),
         ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
@@ -6501,9 +6533,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # also passed the `is not False` check above doesn't fire a second stub.
         self._guest_inline_message_ids[_chat_id_str] = None
         _verb = random.choice(_THINKING_VERBS)
+        _stub_text = f"⏳ {_verb}..."
         _stub = InlineQueryResultArticle(
             id="thinking", title=f"{_verb}...",
-            input_message_content=InputTextMessageContent(f"⏳ {_verb}..."),
+            input_message_content=InputTextMessageContent(_stub_text),
         )
         # Wrap the API call in a Task so asyncio.shield() can protect it from
         # _keep_typing's asyncio.wait_for timeout.  When the 1.5 s timeout fires,
@@ -6522,6 +6555,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._guest_inline_message_ids[_chat_id_str] = _stub_imi
                 # A button tap on this message carries no chat; record the way back now.
                 self._remember_guest_inline_message(_chat_id_str, _stub_imi)
+                self._remember_guest_surface_thread(_chat_id_str, _stub_imi, _stub_text)
             except Exception as _e:
                 self._guest_inline_message_ids[_chat_id_str] = None
                 logger.warning(
@@ -6989,6 +7023,153 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         return getattr(sent, "inline_message_id", None)
 
+    # -- Guest conversation threads (opt-in) ----------------------------------
+    #
+    # A guest chat has no forum topics and no threads of its own: everything the bot
+    # says is a standalone inline message. So a "thread" here is what the chat looks
+    # like it has — a fresh @mention starts one, and replying to one of the bot's
+    # messages continues it. The token rides in ``source.thread_id``, which
+    # ``build_session_key`` already keys on, so one session per thread falls out.
+    #
+    # Identifying WHICH thread a reply belongs to is the whole problem. Answering a
+    # guest query hands back an ``inline_message_id``, never the chat-level
+    # ``message_id`` a reply carries, so the two handles cannot be matched directly.
+    # What the bot does know is the exact text it last wrote to each surface, and that
+    # is what a reply quotes back. So: match the replied-to text, memoize the
+    # ``message_id`` it came with for the repeats, and fall back to the chat's live
+    # thread when neither resolves — a reply to the bot is a continuation even when we
+    # cannot say to what, and guessing "continue" beats silently starting over.
+
+    _GUEST_THREAD_MAP_MAX = 512
+    _GUEST_THREAD_TEXT_KEY_CHARS = 200
+
+    def _guest_thread_text_key(self, text: Optional[str]) -> str:
+        """Normalized lookup key for text the bot wrote (and a reply may quote back)."""
+        collapsed = re.sub(r"\s+", " ", str(text or "")).strip()
+        return collapsed[: self._GUEST_THREAD_TEXT_KEY_CHARS]
+
+    def _new_guest_thread(self, chat_id: str, caller_id: Optional[str]) -> str:
+        """Mint a thread token for *chat_id* and make it the live one.
+
+        The caller id is part of the token so the composed session key stays per-caller:
+        ``build_session_key`` drops its participant component once a thread id is present
+        (threads are shared by default), which would otherwise merge two callers' guest
+        sessions the moment this feature is switched on.
+        """
+        cid = str(chat_id)
+        self._guest_thread_seq += 1
+        token = f"g{self._guest_thread_seq}"
+        if caller_id:
+            token = f"{token}u{caller_id}"
+        self._guest_current_threads[cid] = token
+        self._trim_guest_thread_maps()
+        return token
+
+    def _remember_guest_surface_thread(self, chat_id: Any, inline_message_id: Any, text: Optional[str]) -> None:
+        """Bind a surface (and the text on it) to the chat's live thread.
+
+        Called for every write a user could plausibly reply to — the stub, a prompt, the final
+        answer. Intermediate streaming frames are deliberately skipped: they are superseded, so
+        what a reply quotes is always one of these.
+        """
+        if not self._telegram_guest_thread_sessions():
+            return
+        self._ensure_guest_state()
+        cid = str(chat_id)
+        thread = self._guest_current_threads.get(cid)
+        if not thread:
+            return
+        if inline_message_id:
+            self._guest_thread_by_surface[str(inline_message_id)] = thread
+        key = self._guest_thread_text_key(text)
+        if key:
+            self._guest_thread_by_text[key] = thread
+        self._trim_guest_thread_maps()
+
+    def _trim_guest_thread_maps(self) -> None:
+        """Bound the thread maps; oldest binding goes first (dicts keep insertion order)."""
+        for store in (
+            self._guest_thread_by_surface, self._guest_thread_by_text,
+            self._guest_thread_by_reply_id,
+        ):
+            while len(store) > self._GUEST_THREAD_MAP_MAX:
+                store.pop(next(iter(store)), None)
+        while len(self._guest_current_threads) > self._GUEST_THREAD_MAP_MAX:
+            victim = next(
+                (cid for cid in self._guest_current_threads if not self._is_guest_chat(cid)), None)
+            if victim is None:
+                return
+            self._guest_current_threads.pop(victim, None)
+
+    def _guest_reply_targets_bot(self, reply_msg: Any) -> bool:
+        """Whether *reply_msg* is one of this bot's own messages.
+
+        Checked against ``from_user`` AND ``via_bot``, by id and by handle: a guest bot's message
+        can plausibly be attributed either way, and getting this wrong in the permissive direction
+        would hand someone else's message a thread of ours.
+        """
+        bot_id = getattr(self._bot, "id", None)
+        bot_username = (self._current_bot_username() or "").lower()
+        for holder in (getattr(reply_msg, "from_user", None), getattr(reply_msg, "via_bot", None)):
+            if holder is None:
+                continue
+            if bot_id is not None and getattr(holder, "id", None) == bot_id:
+                return True
+            handle = (getattr(holder, "username", "") or "").lower()
+            if bot_username and handle == bot_username:
+                return True
+        return False
+
+    def _resolve_guest_thread(self, chat_id: str, msg: Any, caller_id: Optional[str]) -> Optional[str]:
+        """The thread token this guest message belongs to, or None when the feature is off.
+
+        A reply to one of the bot's messages continues that message's thread; anything else — a
+        bare @mention, or a reply to somebody else's message — starts a new one.
+        """
+        if not self._telegram_guest_thread_sessions():
+            return None
+        self._ensure_guest_state()
+        cid = str(chat_id)
+        reply_msg = getattr(msg, "reply_to_message", None)
+        if reply_msg is None or not self._guest_reply_targets_bot(reply_msg):
+            token = self._new_guest_thread(cid, caller_id)
+            logger.info("[%s] Guest thread started (chat=%s thread=%s)", self.name, cid, token)
+            return token
+        reply_id = getattr(reply_msg, "message_id", None)
+        memo_key = f"{cid}:{reply_id}" if reply_id is not None else ""
+        text_key = self._guest_thread_text_key(
+            getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None))
+        token = (
+            (self._guest_thread_by_reply_id.get(memo_key) if memo_key else None)
+            or (self._guest_thread_by_text.get(text_key) if text_key else None)
+            or self._guest_current_threads.get(cid)
+        )
+        if not token:
+            # Replying to a message of ours from before this process started: nothing to continue.
+            token = self._new_guest_thread(cid, caller_id)
+            logger.info(
+                "[%s] Guest thread unresolved for a reply; started a new one (chat=%s thread=%s)",
+                self.name, cid, token)
+            return token
+        if memo_key:
+            # Cheap memo so repeat replies to this same message skip the text lookup.
+            self._guest_thread_by_reply_id[memo_key] = token
+        self._guest_current_threads[cid] = token
+        self._trim_guest_thread_maps()
+        logger.info("[%s] Guest thread continued (chat=%s thread=%s)", self.name, cid, token)
+        return token
+
+    @staticmethod
+    def _apply_guest_thread(event: MessageEvent, thread_id: Optional[str]) -> MessageEvent:
+        """Put *thread_id* on the event's source, where build_session_key reads it.
+
+        Applied AFTER _build_message_event so nothing else keyed on a real Telegram thread id
+        (channel prompts, topic bindings) sees this synthetic one.
+        """
+        if thread_id:
+            event.source.thread_id = thread_id
+        return event
+
     # -- One surface, several writers -----------------------------------------
     #
     # A guest chat has exactly ONE message the bot can write: the inline message behind
@@ -7091,6 +7272,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # what ``query.message.text`` would have given for an ordinary message.
         stored = _html.unescape(text) if parse_mode == ParseMode.HTML else text
         self._remember_guest_inline_message(cid, inline_message_id, prompt_text=stored)
+        # A question left on screen is the message a user is most likely to reply to.
+        self._remember_guest_surface_thread(cid, inline_message_id, stored)
         if on_sent is not None:
             # The prompt lives in an inline message, which has no message_id; state that instead
             # of inventing one (nothing reads it, and a fake id would route later edits wrong).
@@ -7181,6 +7364,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # the question that could not be drawn is still the one being waited on, and its
         # plain-text retry would still only reach a buffer nothing can flush until it is answered.
         undeliverable = cid in self._guest_prompt_undeliverable
+        # _finish_guest_prompt binds the new surface to the live thread, so the migrated message
+        # continues the same conversation rather than reading as a new one.
         self._finish_guest_prompt(cid, imi, stub_text, None, parse_mode=None)
         if undeliverable:
             self._guest_prompt_undeliverable.add(cid)
@@ -7401,6 +7586,8 @@ class TelegramAdapter(BasePlatformAdapter):
             _album_event = self._build_message_event(
                 msg, self._media_message_type(msg), update_id=update.update_id)
             _album_event.text = self._clean_bot_trigger_text(_album_event.text)
+            # One album is one request: it joins the turn that its first photo started.
+            self._apply_guest_thread(_album_event, self._guest_current_threads.get(chat_id_str))
             await self._cache_and_route_media(msg, _album_event)
             return
 
@@ -7417,6 +7604,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id_str in self._pending_guest_queries and not has_media:
             _continuation = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
             _continuation.text = self._clean_bot_trigger_text(_continuation.text)
+            # The live thread, never a new one: this text belongs to the turn already running, and
+            # the continuation predicate below matches on the session key it derives from here.
+            self._apply_guest_thread(_continuation, self._guest_current_threads.get(chat_id_str))
             if self._is_guest_clarify_continuation(_continuation):
                 # Same reason as the button path: record the answer BEFORE the gateway intercept
                 # resolves it, so the batch's next question can keep it on screen. The predicate
@@ -7480,6 +7670,10 @@ class TelegramAdapter(BasePlatformAdapter):
             msg, self._media_message_type(msg) if has_media else MessageType.TEXT,
             update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        # One session per conversation thread when the operator opts in: a reply to one of the
+        # bot's messages continues that thread, anything else starts a fresh one. Resolved before
+        # the stub fires, so every surface this turn writes binds to the right thread.
+        self._apply_guest_thread(event, self._resolve_guest_thread(chat_id_str, msg, _guest_caller_id))
 
         # Session isolation per guest caller falls out of _build_message_event for
         # free now: it reads user_id/user_name straight off msg.from_user, which is
@@ -8316,6 +8510,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # the tap. reply_markup on an inline message needs no chat membership.
                         await self._bot.edit_message_text(
                             text=_reply_text, inline_message_id=_guest_imi, reply_markup=_guest_markup)
+                        self._remember_guest_surface_thread(_gc_id, _guest_imi, _reply_text)
                         logger.info(
                             "[%s] guest OPC media edit (chat=%s imi=%s files=%d)",
                             self.name, _gc_id, _guest_imi, len(_guest_media_all))
@@ -8344,6 +8539,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(_tw_delay)
                                 _tw_pos += _tw_chunk
                         await self._bot.edit_message_text(text=_reply_text, inline_message_id=_guest_imi)
+                        # The final answer is what a follow-up reply quotes back, so bind the
+                        # thread to this exact text before the turn lets go of the chat.
+                        self._remember_guest_surface_thread(_gc_id, _guest_imi, _reply_text)
                         logger.warning("[%s] guest OPC text edit (chat=%s imi=%s)", self.name, _gc_id, _guest_imi)
                     elif _guest_qid and _guest_media_all:
                         # No imi, but the query was never spent: answer it with the file
@@ -8490,7 +8688,9 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     for key, env in (
         ("exclusive_bot_mentions", "TELEGRAM_EXCLUSIVE_BOT_MENTIONS"), ("allow_bots", "TELEGRAM_ALLOW_BOTS"),
         ("bots_require_mention", "TELEGRAM_BOTS_REQUIRE_MENTION"),
-        ("guest_mode", "TELEGRAM_GUEST_MODE", ), ("observe_unmentioned_group_messages", "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES")):
+        ("guest_mode", "TELEGRAM_GUEST_MODE", ),
+        ("guest_thread_sessions", "TELEGRAM_GUEST_THREAD_SESSIONS"),
+        ("observe_unmentioned_group_messages", "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES")):
         _bridge_lower(key, env)
     # No extras seed for allowed_chats / allowed_topics / group_allowed_chats: the shared-key loop already
     # bridges them with their original type and this merge would clobber it.

@@ -1967,3 +1967,238 @@ async def test_inline_redemption_keeps_the_token_when_the_answer_fails():
     assert token in gmt._TOKEN_STORE
     assert inline_query.answer.await_args.args[0][0].id == "delivery_failed"
     gmt._TOKEN_STORE.clear()
+
+
+# ---------------------------------------------------------------------------
+# One session per conversation thread (opt-in, guest mode only)
+#
+# A guest chat has no topics of its own — every bot message is a standalone
+# inline message. So a "thread" is what the chat looks like it has: a fresh
+# @mention starts one, replying to a message of the bot's continues it. The token
+# rides in source.thread_id, which build_session_key already keys on.
+# ---------------------------------------------------------------------------
+
+BOT_ID = 4242
+
+
+def _thread_adapter(enabled=True):
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"guest_mode": True, "guest_thread_sessions": enabled}
+    adapter = TelegramAdapter(cfg)
+    adapter._bot = MagicMock()
+    adapter._bot.id = BOT_ID
+    adapter._bot.username = "testbot"
+    adapter._bot.answer_guest_query = AsyncMock(return_value=MagicMock(inline_message_id="imi_abc"))
+    adapter._bot.edit_message_text = AsyncMock()
+    return adapter
+
+
+def _bot_message(text, message_id=500):
+    """A replied-to message that is one of the bot's own."""
+    reply = MagicMock()
+    reply.message_id = message_id
+    reply.text = text
+    reply.caption = None
+    reply.from_user = MagicMock(id=BOT_ID, username="testbot", is_bot=True)
+    reply.via_bot = None
+    for attr in ("photo", "video", "audio", "voice", "document", "sticker"):
+        setattr(reply, attr, None)
+    return reply
+
+
+def _other_users_message(text="just chatting", message_id=501):
+    reply = _bot_message(text, message_id=message_id)
+    reply.from_user = MagicMock(id=999, username="someone", is_bot=False)
+    reply.via_bot = None
+    return reply
+
+
+async def _guest_turn(adapter, *, text, reply_to=None, update_id, gqid="gq_thread", caller_id="999"):
+    """Route one guest mention and hand back the event that was enqueued."""
+    update, msg = _make_guest_update(update_id=update_id, gqid=gqid, text=text, caller_id=caller_id)
+    msg.reply_to_message = reply_to
+    captured = {}
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_apply_telegram_group_observe_attribution", side_effect=lambda e: e), \
+         patch.object(adapter, "_enqueue_text_event", side_effect=lambda e: captured.update(event=e)):
+        await adapter._handle_guest_message_update(update, MagicMock())
+    # The turn owns the chat until OPC; release it so the next mention isn't the busy reply.
+    adapter._pending_guest_queries.pop("42", None)
+    adapter._guest_only_chats.discard("42")
+    return captured.get("event")
+
+
+def _session_key(adapter, event):
+    from gateway.session import build_session_key
+
+    return build_session_key(event.source, group_sessions_per_user=True, thread_sessions_per_user=False)
+
+
+@pytest.mark.asyncio
+async def test_thread_sessions_off_by_default_changes_nothing():
+    """The option is opt-in: off, no thread component is ever set."""
+    adapter = _thread_adapter(enabled=False)
+
+    event = await _guest_turn(adapter, text="@testbot hi", reply_to=None, update_id=101)
+
+    assert event.source.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_bare_mention_starts_a_new_thread_each_time():
+    """"Everything that is not a button and not a reply is a new session for the chat."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn(adapter, text="@testbot first question", reply_to=None, update_id=102)
+    second = await _guest_turn(adapter, text="@testbot unrelated question", reply_to=None, update_id=103)
+
+    assert first.source.thread_id and second.source.thread_id
+    assert first.source.thread_id != second.source.thread_id
+    assert _session_key(adapter, first) != _session_key(adapter, second)
+
+
+@pytest.mark.asyncio
+async def test_replying_to_the_bot_continues_that_thread():
+    """The reply quotes the text the bot last wrote, which is how the thread is identified."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn(adapter, text="@testbot remember the number 7", reply_to=None, update_id=104)
+    adapter._remember_guest_surface_thread("42", "imi_abc", "Noted — the number is 7.")
+
+    follow_up = await _guest_turn(
+        adapter, text="@testbot what was it?", reply_to=_bot_message("Noted — the number is 7."),
+        update_id=105)
+
+    assert first.source.thread_id  # not the vacuous None == None
+    assert follow_up.source.thread_id == first.source.thread_id
+    assert _session_key(adapter, follow_up) == _session_key(adapter, first)
+
+
+@pytest.mark.asyncio
+async def test_a_reply_picks_the_thread_it_points_at_not_the_newest():
+    """Two live threads: replying to the older one must not land in the newer."""
+    adapter = _thread_adapter()
+
+    older = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=106)
+    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+    newer = await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=107)
+    adapter._remember_guest_surface_thread("42", "imi_b", "About B: …")
+
+    back_to_a = await _guest_turn(
+        adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=600),
+        update_id=108)
+
+    assert back_to_a.source.thread_id == older.source.thread_id
+    assert back_to_a.source.thread_id != newer.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_replying_to_someone_else_starts_a_new_thread():
+    """Only the bot's own messages carry a thread; another user's reply target does not."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=109)
+    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+
+    unrelated = await _guest_turn(
+        adapter, text="@testbot what about this?", reply_to=_other_users_message(), update_id=110)
+
+    assert unrelated.source.thread_id != first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognized_reply_to_the_bot_continues_the_live_thread():
+    """A reply to us is a continuation even when the text can no longer be matched."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=111)
+
+    follow_up = await _guest_turn(
+        adapter, text="@testbot and then?", reply_to=_bot_message("something we never recorded"),
+        update_id=112)
+
+    assert first.source.thread_id
+    assert follow_up.source.thread_id == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_the_message_id_memo_survives_an_edited_quote():
+    """Once a reply target is resolved, its message id alone identifies the thread."""
+    adapter = _thread_adapter()
+
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=113)
+    adapter._remember_guest_surface_thread("42", "imi_a", "About A: …")
+    await _guest_turn(
+        adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=700),
+        update_id=114)
+    # A second thread becomes the live one, so a fallback would land in the wrong place.
+    await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=115)
+
+    target = _bot_message("About A: … (edited beyond recognition)", message_id=700)
+    again = await _guest_turn(adapter, text="@testbot still there?", reply_to=target, update_id=116)
+
+    assert first.source.thread_id
+    assert again.source.thread_id == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_the_final_answer_binds_the_thread_it_was_written_in():
+    """End to end: OPC's edit is what a follow-up reply quotes, so it must carry the thread."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter = _thread_adapter()
+    first = await _guest_turn(adapter, text="@testbot remember 7", reply_to=None, update_id=117)
+    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    adapter._guest_reply_buffer["42"] = "Noted — the number is 7."
+    event = MagicMock()
+    event.source.chat_id = "42"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=118)
+
+    written = adapter._bot.edit_message_text.await_args.kwargs["text"]
+    follow_up = await _guest_turn(
+        adapter, text="@testbot what was it?", reply_to=_bot_message(written), update_id=119)
+
+    assert first.source.thread_id
+    assert follow_up.source.thread_id == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_a_typed_clarify_answer_stays_in_the_turns_thread(monkeypatch):
+    """A clarify answer is not a new conversation: it must key to the turn waiting for it."""
+    import tools.clarify_gateway as clarify_gateway
+
+    adapter = _thread_adapter()
+    clarify_gateway._entries.clear()
+    clarify_gateway._session_index.clear()
+    first = await _guest_turn(adapter, text="@testbot book something", reply_to=None, update_id=120)
+    live_thread = first.source.thread_id
+
+    # The turn is in flight and waiting on an open-ended clarify keyed to ITS session.
+    adapter._pending_guest_queries["42"] = "gqid_test"
+    adapter._guest_only_chats.add("42")
+    adapter._guest_inline_message_ids["42"] = "imi_abc"
+    session_key = _session_key(adapter, first)
+    monkeypatch.setattr(adapter, "_gateway_session_key", lambda event: session_key)
+    clarify_gateway.register("c1", session_key, "Which day?", None)
+
+    answer = await _guest_turn(adapter, text="@testbot Tuesday", reply_to=None, update_id=121)
+
+    assert answer is not None, "the answer must reach the turn, not draw the busy reply"
+    assert live_thread
+    assert answer.source.thread_id == live_thread
+    clarify_gateway._entries.clear()
+    clarify_gateway._session_index.clear()
+
+
+@pytest.mark.asyncio
+async def test_two_callers_keep_separate_sessions_in_one_thread_chat():
+    """build_session_key drops its participant slot once a thread is set, so the token carries it."""
+    adapter = _thread_adapter()
+
+    mine = await _guest_turn(adapter, text="@testbot mine", reply_to=None, update_id=122, caller_id="111")
+    theirs = await _guest_turn(adapter, text="@testbot theirs", reply_to=None, update_id=123, caller_id="222")
+
+    assert "111" in mine.source.thread_id and "222" in theirs.source.thread_id
+    assert _session_key(adapter, mine) != _session_key(adapter, theirs)
