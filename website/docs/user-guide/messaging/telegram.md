@@ -1200,9 +1200,11 @@ conversations either way — they belong to the turn that is waiting for them.
 
 A guest chat has no Telegram threads of its own (every bot message is a standalone inline message),
 so the thread a reply belongs to is recognised from the text the reply quotes back, remembered per
-message. Those bindings live in memory: after a gateway restart a reply to one of the bot's older
-messages can no longer be placed, and starts a new conversation instead. A reply the bot cannot
-place for any other reason continues the chat's most recent conversation rather than starting over.
+message in `state.db` next to the sessions themselves. That means the link survives a gateway
+restart: replying to a message from yesterday continues yesterday's conversation, with its history,
+exactly as replying in a chat would. A reply the bot cannot place at all — the binding aged out
+after a month, or the chat was pruned — continues the chat's most recent conversation rather than
+starting over.
 
 Conversations also run **side by side**. Two unrelated mentions both get an answer, each on its own
 message, rather than the second being told to wait — that only happens when a second message lands

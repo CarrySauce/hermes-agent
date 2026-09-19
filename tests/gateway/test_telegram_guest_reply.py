@@ -13,6 +13,7 @@ how PTB >=22.8 actually models Bot API 10.0 guest bots (there is no api_kwargs
 involved). Every fixture below builds updates that shape, not a raw dict.
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -2061,7 +2062,7 @@ async def test_replying_to_the_bot_continues_that_thread():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot remember the number 7", reply_to=None, update_id=104)
-    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_abc", "Noted — the number is 7.")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_abc", "Noted — the number is 7.", chat_id="42")
 
     follow_up = await _guest_turn(
         adapter, text="@testbot what was it?", reply_to=_bot_message("Noted — the number is 7."),
@@ -2078,9 +2079,9 @@ async def test_a_reply_picks_the_thread_it_points_at_not_the_newest():
     adapter = _thread_adapter()
 
     older = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=106)
-    adapter._remember_guest_surface_thread(older.source.thread_id, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(older.source.thread_id, "imi_a", "About A: …", chat_id="42")
     newer = await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=107)
-    adapter._remember_guest_surface_thread(newer.source.thread_id, "imi_b", "About B: …")
+    adapter._remember_guest_surface_thread(newer.source.thread_id, "imi_b", "About B: …", chat_id="42")
 
     back_to_a = await _guest_turn(
         adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=600),
@@ -2096,7 +2097,7 @@ async def test_replying_to_someone_else_starts_a_new_thread():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=109)
-    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
 
     unrelated = await _guest_turn(
         adapter, text="@testbot what about this?", reply_to=_other_users_message(), update_id=110)
@@ -2125,7 +2126,7 @@ async def test_the_message_id_memo_survives_an_edited_quote():
     adapter = _thread_adapter()
 
     first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=113)
-    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
     await _guest_turn(
         adapter, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=700),
         update_id=114)
@@ -2252,7 +2253,7 @@ async def test_a_second_message_in_the_same_thread_still_gets_the_busy_reply():
     adapter = _thread_adapter()
 
     first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=203, gqid="gq_a")
-    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
 
     again = await _guest_turn_live(
         adapter, text="@testbot and also this", update_id=204, gqid="gq_a2",
@@ -2302,8 +2303,8 @@ async def test_a_tap_resolves_to_the_turn_whose_surface_it_happened_on():
     adapter._guest_chat_types["42"] = "supergroup"
     adapter._remember_guest_inline_message("42", "imi_a")
     adapter._remember_guest_inline_message("42", "imi_b")
-    adapter._remember_guest_surface_thread(ta, "imi_a", "About A: …")
-    adapter._remember_guest_surface_thread(tb, "imi_b", "About B: …")
+    adapter._remember_guest_surface_thread(ta, "imi_a", "About A: …", chat_id="42")
+    adapter._remember_guest_surface_thread(tb, "imi_b", "About B: …", chat_id="42")
 
     assert adapter._callback_ctx(_tap(adapter, data="cl:x:0", imi="imi_a"))["guest_turn_key"] == ta
     assert adapter._callback_ctx(_tap(adapter, data="cl:x:0", imi="imi_b"))["guest_turn_key"] == tb
@@ -2345,7 +2346,7 @@ async def test_the_ladder_refuses_rather_than_writing_to_the_wrong_surface():
     assert ambiguous.error == "guest_turn_unresolved"
     # An explicit thread still resolves, and a surface resolves without one.
     assert adapter._guest_turn_key(chat_id="42", metadata={"thread_id": "g7u1"}) == "g7u1"
-    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …")
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
     assert adapter._guest_turn_key(chat_id="42", inline_message_id="imi_a") == first.source.thread_id
 
 
@@ -2377,3 +2378,106 @@ async def test_with_the_feature_off_the_guard_stays_chat_wide():
     assert adapter._bot.answer_guest_query.await_args.args[1].id == "busy"
     assert adapter._pending_guest_queries == {"42": "gq_a"}
     assert adapter._guest_turn_key(chat_id="42") == "42"
+
+
+# ---------------------------------------------------------------------------
+# Threads survive a restart
+#
+# The SESSION behind a thread is keyed by thread_id and already lives in state.db.
+# Only the binding from a bot message to its thread was in memory, which is what
+# made a reply after a restart start a new conversation instead of continuing.
+# ---------------------------------------------------------------------------
+
+async def _drain_background(adapter):
+    """Wait out the fire-and-forget binding writes."""
+    while adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+
+
+@pytest.fixture
+def guest_binding_home(tmp_path, monkeypatch):
+    """Point the binding store at a temp state.db, as a deployed gateway's HERMES_HOME would."""
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_a_restart_continues_its_own_conversation(guest_binding_home):
+    """The gap this closes: the session was durable, the binding to it was not."""
+    adapter = _thread_adapter()
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=301)
+    await _guest_turn(adapter, text="@testbot topic B", reply_to=None, update_id=302)
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
+    await _drain_background(adapter)
+
+    # A new process: same state.db, no in-memory bindings at all.
+    restarted = _thread_adapter()
+    assert not restarted._guest_thread_by_text and not restarted._guest_thread_by_surface
+
+    follow_up = await _guest_turn(
+        restarted, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=901),
+        update_id=303)
+
+    assert follow_up.source.thread_id == first.source.thread_id
+    assert _session_key(restarted, follow_up) == _session_key(adapter, first)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_memoizes_the_reply_target_durably(guest_binding_home):
+    """The recovered binding is written back, so a second reply skips the text lookup."""
+    adapter = _thread_adapter()
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=304)
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
+    await _drain_background(adapter)
+
+    restarted = _thread_adapter()
+    await _guest_turn(
+        restarted, text="@testbot go on", reply_to=_bot_message("About A: …", message_id=902),
+        update_id=305)
+    await _drain_background(restarted)
+
+    stored = await restarted._stored_guest_thread("42", surface_key="msg:902")
+    assert stored == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_a_new_conversation_after_a_restart_never_reuses_an_old_thread_key(guest_binding_home):
+    """The mint counter restarts at 0, and the token ends up in a session key."""
+    adapter = _thread_adapter()
+    before = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=306)
+
+    restarted = _thread_adapter()
+    after = await _guest_turn(restarted, text="@testbot something new", reply_to=None, update_id=307)
+
+    assert before.source.thread_id != after.source.thread_id
+    assert _session_key(adapter, before) != _session_key(restarted, after)
+
+
+@pytest.mark.asyncio
+async def test_an_unplaceable_reply_after_a_restart_continues_the_chats_last_thread(guest_binding_home):
+    """Better than starting over: the reply is to us, so it belongs to something of ours."""
+    adapter = _thread_adapter()
+    first = await _guest_turn(adapter, text="@testbot topic A", reply_to=None, update_id=308)
+    adapter._remember_guest_surface_thread(first.source.thread_id, "imi_a", "About A: …", chat_id="42")
+    await _drain_background(adapter)
+
+    restarted = _thread_adapter()
+    follow_up = await _guest_turn(
+        restarted, text="@testbot and this?", reply_to=_bot_message("text we never recorded"),
+        update_id=309)
+
+    assert follow_up.source.thread_id == first.source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_persisted_while_the_feature_is_off(guest_binding_home):
+    """Off, the store is never even created — a gateway that never opts in never grows it."""
+    adapter = _thread_adapter(enabled=False)
+    await _guest_turn(adapter, text="@testbot hi", reply_to=None, update_id=310)
+    adapter._remember_guest_surface_thread("42", "imi_a", "Some reply", chat_id="42")
+    await _drain_background(adapter)
+
+    assert not (guest_binding_home / "state.db").exists()
+    assert await adapter._stored_guest_thread("42", surface_key="imi_a") is None

@@ -6713,7 +6713,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._guest_inline_message_ids[_turn_key] = _stub_imi
                 # A button tap on this message carries no chat; record the way back now.
                 self._remember_guest_inline_message(_chat_id_str, _stub_imi)
-                self._remember_guest_surface_thread(_turn_key, _stub_imi, _stub_text)
+                self._remember_guest_surface_thread(
+                    _turn_key, _stub_imi, _stub_text, chat_id=_chat_id_str)
             except Exception as _e:
                 self._guest_inline_message_ids[_turn_key] = None
                 logger.warning(
@@ -7214,10 +7215,10 @@ class TelegramAdapter(BasePlatformAdapter):
     _GUEST_THREAD_MAP_MAX = 512
     _GUEST_THREAD_TEXT_KEY_CHARS = 200
 
-    # Minted by _new_guest_thread as g<seq>[u<caller>]. A chat id is numeric, so the two key
-    # spaces cannot collide — which is what lets a turn key be read as "thread or chat" without
-    # consulting live state that may already have been torn down.
-    _GUEST_THREAD_TOKEN_RE = re.compile(r"^g\d+(?:u\S+)?$")
+    # Minted by _new_guest_thread as g<seq><rand>[u<caller>]. A chat id is numeric (or an
+    # @handle), so the two key spaces cannot collide — which is what lets a turn key be read as
+    # "thread or chat" without consulting live state that may already have been torn down.
+    _GUEST_THREAD_TOKEN_RE = re.compile(r"^g[0-9a-f]+(?:u\S+)?$")
 
     def _is_guest_thread_token(self, value: Any) -> bool:
         """Whether *value* is a guest thread token rather than a chat id."""
@@ -7238,14 +7239,19 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         cid = str(chat_id)
         self._guest_thread_seq += 1
-        token = f"g{self._guest_thread_seq}"
+        # The counter restarts at 0 in a new process, and the token lands in a SESSION KEY: a
+        # bare sequence would have a fresh conversation after a restart reuse a pre-restart
+        # thread's key and silently resume its history. The random tail makes every mint its own.
+        token = f"g{self._guest_thread_seq}{random.getrandbits(16):04x}"
         if caller_id:
             token = f"{token}u{caller_id}"
         self._guest_current_threads[cid] = token
         self._trim_guest_thread_maps()
         return token
 
-    def _remember_guest_surface_thread(self, turn_key: Any, inline_message_id: Any, text: Optional[str]) -> None:
+    def _remember_guest_surface_thread(
+        self, turn_key: Any, inline_message_id: Any, text: Optional[str], *, chat_id: Any,
+    ) -> None:
         """Bind a surface (and the text on it) to the thread of the turn that wrote it.
 
         Called for every write a user could plausibly reply to — the stub, a prompt, the final
@@ -7255,6 +7261,10 @@ class TelegramAdapter(BasePlatformAdapter):
         Keyed on the WRITING turn, never on the chat's most recent thread: with two conversations
         live, the chat-level answer would file one turn's surface under the other's thread and
         send a later reply into the wrong conversation.
+
+        *chat_id* is passed in rather than looked up from the turn: the last binding of a turn is
+        written by the completion flush, which has already released the turn by then, and a
+        lookup would file the row under the thread token as if it were a chat.
         """
         if not self._telegram_guest_thread_sessions():
             return
@@ -7269,6 +7279,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if key:
             self._guest_thread_by_text[key] = thread
         self._trim_guest_thread_maps()
+        # Same binding, durably: this is the moment a future reply can be resolved from.
+        if inline_message_id and chat_id:
+            self._persist_guest_binding(str(chat_id), str(inline_message_id), thread, key)
 
     def _trim_guest_thread_maps(self) -> None:
         """Bound the thread maps; oldest binding goes first (dicts keep insertion order)."""
@@ -7284,6 +7297,91 @@ class TelegramAdapter(BasePlatformAdapter):
             if victim is None:
                 return
             self._guest_current_threads.pop(victim, None)
+
+    # Bindings also go to state.db. The SESSION behind a thread already survives a restart
+    # there — it is keyed by ``thread_id`` like any other session — so persisting the binding is
+    # what makes the whole link durable instead of only the session behind it. Path and profile
+    # are resolved on the caller's thread: reading HERMES_HOME inside the worker would see the
+    # LAUNCH profile's home under multiplex, not the one this adapter serves.
+
+    def _guest_binding_scope(self) -> tuple:
+        """``(state.db path, profile name)`` for this adapter's own profile."""
+        import hermes_constants
+        profile = self._session_key_profile(None) or "default"
+        return _Path(hermes_constants.get_hermes_home()) / "state.db", str(profile)
+
+    @staticmethod
+    def _guest_binding_write_sync(db_path, profile: str, chat_id: str, surface_key: str,
+                                  thread_token: str, text_key: Optional[str]) -> None:
+        """Record one binding. Runs in a worker thread; acquires and releases its own handle."""
+        from hermes_state_registry import acquire, release_or_close
+        db = acquire(db_path)
+        try:
+            db.record_telegram_guest_thread(
+                chat_id=chat_id, surface_key=surface_key, thread_token=thread_token,
+                text_key=text_key, profile_name=profile)
+        finally:
+            release_or_close(db)
+
+    @staticmethod
+    def _guest_binding_read_sync(db_path, profile: str, chat_id: str, surface_key: Optional[str],
+                                 text_key: Optional[str], latest: bool) -> Optional[str]:
+        """Resolve a binding (or the chat's most recent thread). Runs in a worker thread."""
+        from hermes_state_registry import acquire, release_or_close
+        db = acquire(db_path)
+        try:
+            if latest:
+                return db.latest_telegram_guest_thread(chat_id=chat_id, profile_name=profile)
+            return db.lookup_telegram_guest_thread(
+                chat_id=chat_id, surface_key=surface_key, text_key=text_key, profile_name=profile)
+        finally:
+            release_or_close(db)
+
+    def _persist_guest_binding(self, chat_id: str, surface_key: str, thread_token: str,
+                               text_key: Optional[str] = None) -> None:
+        """Write a binding to state.db off the event loop, best effort.
+
+        Fire and forget on purpose: a lost binding costs a reply its conversation after a
+        restart, which is a degraded answer — never a failed turn — so it must not be able to
+        delay or break the write that triggered it.
+        """
+        if not self._telegram_guest_thread_sessions() or not surface_key or not thread_token:
+            return
+        try:
+            db_path, profile = self._guest_binding_scope()
+        except Exception:
+            logger.debug("[%s] guest binding scope unavailable", self.name, exc_info=True)
+            return
+
+        async def _write() -> None:
+            try:
+                await asyncio.to_thread(
+                    self._guest_binding_write_sync, db_path, profile, str(chat_id),
+                    str(surface_key), str(thread_token), text_key or None)
+            except Exception as exc:
+                logger.debug("[%s] guest binding write failed: %s", self.name, exc)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_write())
+        except RuntimeError:
+            # No loop (a sync caller in tests): the in-memory maps still carry this turn.
+            return
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _stored_guest_thread(self, chat_id: str, *, surface_key: Optional[str] = None,
+                                   text_key: Optional[str] = None, latest: bool = False) -> Optional[str]:
+        """A binding from state.db, or None (including when the store is unreachable)."""
+        if not self._telegram_guest_thread_sessions():
+            return None
+        try:
+            db_path, profile = self._guest_binding_scope()
+            return await asyncio.to_thread(
+                self._guest_binding_read_sync, db_path, profile, str(chat_id),
+                surface_key or None, text_key or None, latest)
+        except Exception as exc:
+            logger.debug("[%s] guest binding lookup failed: %s", self.name, exc)
+            return None
 
     def _guest_reply_targets_bot(self, reply_msg: Any) -> bool:
         """Whether *reply_msg* is one of this bot's own messages.
@@ -7304,11 +7402,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _resolve_guest_thread(self, chat_id: str, msg: Any, caller_id: Optional[str]) -> Optional[str]:
+    async def _resolve_guest_thread(self, chat_id: str, msg: Any, caller_id: Optional[str]) -> Optional[str]:
         """The thread token this guest message belongs to, or None when the feature is off.
 
         A reply to one of the bot's messages continues that message's thread; anything else — a
-        bare @mention, or a reply to somebody else's message — starts a new one.
+        bare @mention, or a reply to somebody else's message — starts a new one. Bindings are read
+        from memory first and then from ``state.db``, so a reply that arrives after a restart still
+        lands in its own conversation.
         """
         if not self._telegram_guest_thread_sessions():
             return None
@@ -7321,6 +7421,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return token
         reply_id = getattr(reply_msg, "message_id", None)
         memo_key = f"{cid}:{reply_id}" if reply_id is not None else ""
+        surface_memo = f"msg:{reply_id}" if reply_id is not None else ""
         text_key = self._guest_thread_text_key(
             getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None))
         token = (
@@ -7329,7 +7430,22 @@ class TelegramAdapter(BasePlatformAdapter):
             or self._guest_current_threads.get(cid)
         )
         if not token:
-            # Replying to a message of ours from before this process started: nothing to continue.
+            # Nothing in memory — this process may simply not have written the message being
+            # replied to (a restart since). The store remembers it.
+            token = await self._stored_guest_thread(
+                cid, surface_key=surface_memo or None, text_key=text_key or None)
+            if token:
+                logger.info(
+                    "[%s] Guest thread recovered from the binding store (chat=%s thread=%s)",
+                    self.name, cid, token)
+            else:
+                token = await self._stored_guest_thread(cid, latest=True)
+                if token:
+                    logger.info(
+                        "[%s] Guest thread unresolved for a reply; continuing the chat's last one "
+                        "(chat=%s thread=%s)", self.name, cid, token)
+        if not token:
+            # Replying to a message of ours we have no record of at all.
             token = self._new_guest_thread(cid, caller_id)
             logger.info(
                 "[%s] Guest thread unresolved for a reply; started a new one (chat=%s thread=%s)",
@@ -7338,6 +7454,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if memo_key:
             # Cheap memo so repeat replies to this same message skip the text lookup.
             self._guest_thread_by_reply_id[memo_key] = token
+            # And durably, so the memo outlives this process too.
+            self._persist_guest_binding(cid, surface_memo, token, text_key or None)
         self._guest_current_threads[cid] = token
         self._trim_guest_thread_maps()
         logger.info("[%s] Guest thread continued (chat=%s thread=%s)", self.name, cid, token)
@@ -7459,7 +7577,7 @@ class TelegramAdapter(BasePlatformAdapter):
         stored = _html.unescape(text) if parse_mode == ParseMode.HTML else text
         self._remember_guest_inline_message(chat_id, inline_message_id, prompt_text=stored)
         # A question left on screen is the message a user is most likely to reply to.
-        self._remember_guest_surface_thread(key, inline_message_id, stored)
+        self._remember_guest_surface_thread(key, inline_message_id, stored, chat_id=chat_id)
         if on_sent is not None:
             # The prompt lives in an inline message, which has no message_id; state that instead
             # of inventing one (nothing reads it, and a fake id would route later edits wrong).
@@ -7878,7 +7996,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Which conversation this mention belongs to: a reply to one of the bot's messages
         # continues that thread, anything else starts a fresh one. Resolved BEFORE the busy guard
         # so the guard can be about the thread rather than the chat.
-        _thread_token = self._resolve_guest_thread(chat_id_str, msg, _guest_caller_id)
+        _thread_token = await self._resolve_guest_thread(chat_id_str, msg, _guest_caller_id)
         _turn_key = _thread_token or chat_id_str
 
         # One surface per turn, so two turns in ONE conversation would still fight over it: the
@@ -8757,7 +8875,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         # the tap. reply_markup on an inline message needs no chat membership.
                         await self._bot.edit_message_text(
                             text=_reply_text, inline_message_id=_guest_imi, reply_markup=_guest_markup)
-                        self._remember_guest_surface_thread(_gc_turn, _guest_imi, _reply_text)
+                        self._remember_guest_surface_thread(
+                            _gc_turn, _guest_imi, _reply_text, chat_id=_gc_id)
                         logger.info(
                             "[%s] guest OPC media edit (chat=%s imi=%s files=%d)",
                             self.name, _gc_id, _guest_imi, len(_guest_media_all))
@@ -8788,7 +8907,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._bot.edit_message_text(text=_reply_text, inline_message_id=_guest_imi)
                         # The final answer is what a follow-up reply quotes back, so bind the
                         # thread to this exact text before the turn lets go of the chat.
-                        self._remember_guest_surface_thread(_gc_turn, _guest_imi, _reply_text)
+                        self._remember_guest_surface_thread(
+                            _gc_turn, _guest_imi, _reply_text, chat_id=_gc_id)
                         logger.warning("[%s] guest OPC text edit (chat=%s imi=%s)", self.name, _gc_id, _guest_imi)
                     elif _guest_qid and _guest_media_all:
                         # No imi, but the query was never spent: answer it with the file
