@@ -2481,3 +2481,217 @@ async def test_nothing_is_persisted_while_the_feature_is_off(guest_binding_home)
 
     assert not (guest_binding_home / "state.db").exists()
     assert await adapter._stored_guest_thread("42", surface_key="imi_a") is None
+
+
+# ---------------------------------------------------------------------------
+# Guest progress card — the stub becomes a live "what is it doing" message
+#
+# A guest chat has ONE writable message per turn, so tool-progress bubbles and the
+# "⏳ Working" heartbeat had nowhere to go and were dropped: the user watched a static
+# "⏳ Cooking..." for the whole turn. They are folded into that one message instead,
+# edited at most once per interval and only when the text actually changed.
+# ---------------------------------------------------------------------------
+
+async def _card_adapter(extra=None, chat_id="42"):
+    """A guest adapter whose stub has fired, so there is an inline message to edit."""
+    adapter = _make_adapter()
+    adapter.config.extra.update(extra or {})
+    _register_guest_chat(adapter, chat_id)
+    await adapter._guest_fire_text_stub(chat_id)
+    adapter._bot.edit_message_text.reset_mock()
+    return adapter
+
+
+def _card_edits(adapter):
+    return [call.kwargs["text"] for call in adapter._bot.edit_message_text.await_args_list]
+
+
+def _age_card(adapter, turn_key="42", seconds=60.0):
+    """Push the last edit into the past so the throttle no longer blocks the next draw."""
+    adapter._guest_progress_cards[str(turn_key)]["last_edit"] -= seconds
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_shows_actions_and_the_iteration_counter():
+    """Both halves of the ask on one message: what it is doing, and how far along it is."""
+    adapter = await _card_adapter()
+
+    result = await adapter.send(
+        "42", "💻 terminal\n🔍 Searching the web for hermes",
+        metadata={"agent_iteration": 4, "agent_max_iterations": 150})
+
+    assert result.success and result.message_id is None
+    text = _card_edits(adapter)[-1]
+    assert text.startswith("⏳ Working — ")
+    assert "iteration 4/150" in text
+    assert "💻 terminal" in text and "🔍 Searching the web for hermes" in text
+    assert adapter._bot.edit_message_text.await_args.kwargs["inline_message_id"] == "imi_abc"
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_keeps_only_the_last_three_actions():
+    """Three lines is what stays readable on a phone; the bubble is cumulative and unbounded."""
+    adapter = await _card_adapter()
+
+    await adapter.send("42", "1️⃣ one\n2️⃣ two\n3️⃣ three\n4️⃣ four\n5️⃣ five", metadata={})
+
+    text = _card_edits(adapter)[-1]
+    assert "1️⃣ one" not in text and "2️⃣ two" not in text
+    assert "3️⃣ three" in text and "4️⃣ four" in text and "5️⃣ five" in text
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_folds_a_terminal_fence_into_one_action():
+    """A terminal action spans a fenced block — counting lines would show one action as three."""
+    adapter = await _card_adapter()
+
+    await adapter.send("42", "🔍 searching\n💻 terminal\n```\nls -la /workspace\n```", metadata={})
+
+    text = _card_edits(adapter)[-1]
+    assert "💻 terminal: ls -la /workspace" in text
+    assert "```" not in text
+    assert "🔍 searching" in text
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_edits_at_most_once_per_interval():
+    """The throttle is the whole point: one edit per action would hit Telegram's limits."""
+    adapter = await _card_adapter()
+
+    await adapter.send("42", "💻 terminal", metadata={})
+    await adapter.send("42", "💻 terminal\n🔍 searching", metadata={})
+    await adapter.send("42", "💻 terminal\n🔍 searching\n📄 reading", metadata={})
+
+    assert adapter._bot.edit_message_text.await_count == 1
+
+    _age_card(adapter)
+    await adapter.send("42", "💻 terminal\n🔍 searching\n📄 reading\n🌐 fetching", metadata={})
+
+    assert adapter._bot.edit_message_text.await_count == 2
+    assert "🌐 fetching" in _card_edits(adapter)[-1]
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_does_not_edit_when_nothing_changed():
+    """"Only when needed": past the interval, an unchanged card still costs no API call."""
+    adapter = await _card_adapter()
+    await adapter.send("42", "💻 terminal", metadata={})
+    assert adapter._bot.edit_message_text.await_count == 1
+
+    _age_card(adapter)
+    await adapter.send("42", "💻 terminal", metadata={})
+
+    assert adapter._bot.edit_message_text.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_ticks_the_clock_from_the_typing_refresh():
+    """A single slow tool emits no progress line; the typing refresh is what keeps elapsed moving."""
+    adapter = await _card_adapter()
+    await adapter.send("42", "💻 terminal", metadata={})
+    card = adapter._guest_progress_cards["42"]
+    card["started"] -= 180.0          # the turn has been running three minutes
+    _age_card(adapter)
+
+    await adapter.send_typing("42")
+
+    assert "3 min" in _card_edits(adapter)[-1]
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_stops_once_the_reply_starts_streaming():
+    """The answer owns the surface from its first frame — a late progress edit would erase it."""
+    adapter = await _card_adapter()
+    await adapter.send("42", "💻 terminal", metadata={})
+    await adapter.send("42", "Here is the answer", metadata={"expect_edits": True})
+    adapter._bot.edit_message_text.reset_mock()
+
+    _age_card(adapter)
+    await adapter.send("42", "💻 terminal\n🔍 searching", metadata={})
+
+    adapter._bot.edit_message_text.assert_not_awaited()
+    assert adapter._guest_reply_buffer["42"] == "Here is the answer"
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_retires_when_a_question_takes_the_surface():
+    """The turn is blocked on that question; redrawing progress over it is the hang we fixed."""
+    adapter = await _card_adapter()
+    await adapter.send("42", "💻 terminal", metadata={})
+    adapter._finish_guest_prompt("42", "imi_abc", "❓ Which one?", None, parse_mode=None)
+    adapter._bot.edit_message_text.reset_mock()
+
+    _age_card(adapter)
+    await adapter.send("42", "💻 terminal\n🔍 searching", metadata={})
+
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_ignores_the_heartbeats_own_wording():
+    """The "⏳ Working" heartbeat restates what the card already shows — it is not an action."""
+    adapter = await _card_adapter()
+
+    await adapter.send("42", "⏳ Working — 3 min — iteration 4/150, terminal",
+                       metadata={"_interim_send": True})
+
+    assert adapter._guest_progress_cards["42"]["actions"] == []
+    for text in _card_edits(adapter):
+        assert "iteration 4/150, terminal" not in text
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_card_can_be_turned_off():
+    """Off, the turn is back to the plain stub and progress is dropped as before."""
+    adapter = await _card_adapter({"guest_progress_card": False})
+
+    result = await adapter.send("42", "💻 terminal", metadata={})
+
+    assert result.success
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_progress_cards_do_not_cross_between_concurrent_turns():
+    """Two mentions in one chat have two messages; each card must edit its own."""
+    adapter = _thread_adapter()
+    first = await _guest_turn_live(adapter, text="@testbot topic A", update_id=401, gqid="gq_a")
+    second = await _guest_turn_live(adapter, text="@testbot topic B", update_id=402, gqid="gq_b")
+    ta, tb = first.source.thread_id, second.source.thread_id
+    adapter._bot.answer_guest_query = AsyncMock(
+        side_effect=[MagicMock(inline_message_id="imi_a"), MagicMock(inline_message_id="imi_b")])
+    await adapter._guest_fire_text_stub(ta)
+    await adapter._guest_fire_text_stub(tb)
+    adapter._bot.edit_message_text.reset_mock()
+
+    await adapter.send("42", "💻 terminal for A", metadata={"thread_id": ta})
+    await adapter.send("42", "🔍 searching for B", metadata={"thread_id": tb})
+
+    drawn = {call.kwargs["inline_message_id"]: call.kwargs["text"]
+             for call in adapter._bot.edit_message_text.await_args_list}
+    assert "💻 terminal for A" in drawn["imi_a"] and "terminal for A" not in drawn["imi_b"]
+    assert "🔍 searching for B" in drawn["imi_b"]
+
+
+def test_guest_elapsed_is_rendered_coarsely():
+    """Elapsed is what would otherwise change every tick — coarse steps are what make
+    "only when needed" hold for an idle turn."""
+    fmt = TelegramAdapter._format_guest_elapsed
+    assert fmt(3.0) == "<10s"
+    assert fmt(12.0) == "10s" and fmt(19.9) == "10s"
+    assert fmt(59.0) == "50s"
+    assert fmt(61.0) == "1 min" and fmt(190.0) == "3 min"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_guest_progress_edit_is_redrawn_next_interval():
+    """Remembering text that never landed would leave the card frozen on a transient error."""
+    adapter = await _card_adapter()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=[RuntimeError("flood"), None])
+
+    await adapter.send("42", "💻 terminal", metadata={})
+    _age_card(adapter)
+    await adapter.send("42", "💻 terminal", metadata={})
+
+    assert adapter._bot.edit_message_text.await_count == 2
+    assert adapter._guest_progress_cards["42"]["rendered"] == _card_edits(adapter)[-1]

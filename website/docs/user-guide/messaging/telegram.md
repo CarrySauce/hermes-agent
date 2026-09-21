@@ -1230,6 +1230,37 @@ a previous request" reply instead, so nothing is silently swallowed.
 Slash commands are not routed in guest chats — each command would consume a second reply slot —
 so the bot answers those with a short note instead.
 
+**Live progress on the placeholder.** A guest chat has exactly one message the bot may write to,
+so the per-tool progress bubbles and the "⏳ Working" heartbeat a private chat gets have nowhere of
+their own to go. They are folded into the placeholder instead, which turns into a small live card:
+
+```
+⏳ Working — 2 min — iteration 7/150
+
+💻 terminal: rg -n "guest_query" plugins/
+🔍 Searching the web for telegram guest bots
+📄 Reading adapter.py
+```
+
+The last three actions are kept, and the card is redrawn by editing that one message — at most once
+every 10 seconds, and only when the text actually changed, so a turn that sits in one long tool call
+costs about one edit a minute. It stops as soon as the answer starts arriving (the reply takes the
+message over) and retires for good if a question is drawn on it, so nothing ever paints over
+something the turn is waiting on. Turn it off, or change the cadence, with:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_progress_card: true              # default true
+        guest_progress_interval_seconds: 10    # default 10, minimum 1
+```
+
+Env equivalents: `TELEGRAM_GUEST_PROGRESS_CARD`, `TELEGRAM_GUEST_PROGRESS_INTERVAL_SECONDS`. With
+the card off, a guest turn shows the plain "⏳ Thinking…" placeholder until the reply replaces it.
+
 ## Slash Command Access Control
 
 By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the platform's `extra` block:

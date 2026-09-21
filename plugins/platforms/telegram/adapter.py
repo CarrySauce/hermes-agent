@@ -3667,6 +3667,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         # plain-text fallback takes a successful send as proof it arrived and
                         # then waits for an answer to a question nobody ever saw.
                         return SendResult(success=False, error="guest_no_inline_message")
+                    # Fold this bubble into the one message the chat can see. Interim status sends
+                    # (the "⏳ Working" heartbeat, advisories) re-state what the card already shows,
+                    # so they tick it without becoming an action line of their own.
+                    if not (metadata or {}).get("_interim_send"):
+                        self._record_guest_progress(_tk, content, metadata)
+                    await self._draw_guest_progress_card(_tk)
                     return SendResult(success=True, message_id=None)
 
                 # Streaming: fire the stub now if it hasn't fired yet (covers responses
@@ -3678,6 +3684,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if _imi_val is False:
                     await self._guest_fire_text_stub(_tk)
                     _imi_val = self._guest_inline_message_ids.get(_tk)
+                # The answer is arriving: progress has said all it is going to say, and an edit
+                # from it now would land on top of the reply.
+                self._close_guest_progress_card(_tk)
 
                 # Stub fired (imi available or not) — buffer mode: accumulate
                 # content so OPC delivers the full response at once.
@@ -3851,6 +3860,7 @@ class TelegramAdapter(BasePlatformAdapter):
             inline_message_id=message_id, chat_id=chat_id, metadata=metadata)
         _imi = self._guest_inline_message_ids.get(_edit_tk) if _edit_tk else None
         if isinstance(_imi, str) and message_id == _imi:
+            self._close_guest_progress_card(_edit_tk)
             _text = content
             for _cur in (" ▉", "▉"):
                 if _text.endswith(_cur):
@@ -5621,6 +5631,11 @@ class TelegramAdapter(BasePlatformAdapter):
             and self._guest_inline_message_ids.get(_typing_tk) is False
         ):
             await self._guest_fire_text_stub(_typing_tk)
+        # Typing refreshes every ~2s, which is what keeps "how long it has been working" moving
+        # while one slow tool runs and no progress line arrives. The card's own throttle decides
+        # whether a tick becomes an edit.
+        if _typing_tk is not None and self._is_guest_chat(_cid_str):
+            await self._draw_guest_progress_card(_typing_tk)
 
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
@@ -5819,6 +5834,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_thread_by_reply_id", dict),
         ("_guest_turns_by_chat", dict), ("_guest_turn_chats", dict),
         ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
+        ("_guest_progress_cards", dict),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -5930,6 +5946,16 @@ class TelegramAdapter(BasePlatformAdapter):
         cid, key = str(chat_id), str(turn_key)
         self._pending_guest_queries[key] = guest_query_id
         self._guest_turn_chats[key] = cid
+        # Start the progress clock here: "how long has it been working" is measured from the
+        # mention, not from the first tool call.
+        self._guest_progress_cards[key] = {
+            "actions": [], "iteration": None, "started": time.monotonic(),
+            # gen: the surface generation this card owns. With guest_thread_sessions off the turn
+            # key IS the chat id, so a second turn in the chat inherits the first turn's counter —
+            # baseline it here rather than assuming 0, or the card would retire on its first draw.
+            "last_edit": 0.0, "rendered": "", "gen": self._guest_surface_generation(key),
+            "closed": False,
+        }
         live = self._guest_turns_by_chat.setdefault(cid, [])
         if key not in live:
             live.append(key)
@@ -5948,7 +5974,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for store in (
             self._pending_guest_queries, self._guest_inline_message_ids, self._guest_reply_buffer,
             self._guest_turn_media, self._guest_turn_media_all, self._guest_answered_lines,
-            self._guest_media_group_ids,
+            self._guest_media_group_ids, self._guest_progress_cards,
         ):
             store.pop(key, None)
         self._guest_prompt_undeliverable.discard(key)
@@ -7523,6 +7549,184 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         turn_key = self._guest_turn_key(inline_message_id=imi, chat_id=guest.get("chat_id"))
         return self._guest_surface_moved(turn_key or "", generation)
+
+    # ── Guest progress card ──────────────────────────────────────────────────
+    #
+    # A guest chat has exactly one writable message per turn, so the progress a private chat gets
+    # (a bubble per tool, plus the three-minute "⏳ Working — N min — iteration X/Y" heartbeat) has
+    # nowhere to go: send() dropped it and the user watched a static "⏳ Cooking..." for the whole
+    # turn. Both streams are folded into the stub instead — the last few actions above which
+    # iteration the agent is on and how long it has been working — and rendered by editing that one
+    # message. Two gates keep the edit rate far below anything Telegram throttles: at most one edit
+    # per ``guest_progress_interval_seconds`` (10s), and only when the rendered text actually
+    # changed, which is why elapsed time is rendered coarsely (10s steps, then whole minutes) — an
+    # idle turn costs one edit a minute, not six.
+
+    _GUEST_PROGRESS_ACTIONS = 3
+    _GUEST_PROGRESS_LINE_MAX = 120
+    _GUEST_PROGRESS_DEFAULT_INTERVAL = 10.0
+
+    def _telegram_guest_progress_card(self) -> bool:
+        """Whether guest turns render live progress into the message already on screen."""
+        return self._extra_bool("guest_progress_card", "TELEGRAM_GUEST_PROGRESS_CARD", "true")
+
+    def _telegram_guest_progress_interval(self) -> float:
+        """Minimum seconds between two progress edits of the same guest message."""
+        raw = _extra_or_secret(
+            self.config.extra, "guest_progress_interval_seconds",
+            "TELEGRAM_GUEST_PROGRESS_INTERVAL_SECONDS", None)
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            return self._GUEST_PROGRESS_DEFAULT_INTERVAL
+
+    def _guest_progress_state(self, turn_key: Any) -> Optional[Dict[str, Any]]:
+        """The live progress record for *turn_key*, or None when the card is done with.
+
+        Missing = the turn was released (or started before this state existed); ``closed`` = the
+        surface now belongs to something the card must never overwrite — a control prompt whose
+        answer the turn is blocked on, or the reply itself.
+        """
+        self._ensure_guest_state()
+        card = self._guest_progress_cards.get(str(turn_key))
+        return None if card is None or card.get("closed") else card
+
+    def _close_guest_progress_card(self, turn_key: Any) -> None:
+        """Stop rendering progress for *turn_key*: the reply or a question owns the surface now."""
+        self._ensure_guest_state()
+        card = self._guest_progress_cards.get(str(turn_key))
+        if card is not None:
+            card["closed"] = True
+
+    @classmethod
+    def _guest_progress_entries(cls, text: str) -> List[str]:
+        """One short line per action from a tool-progress bubble.
+
+        A guest send returns no message id, so the gateway has nothing to edit and re-sends the
+        WHOLE bubble every tick; a terminal action inside it spans a fenced block. Folding each
+        fence into the header above it makes "the last three actions" count actions, not lines.
+        """
+        entries: List[str] = []
+        fence: Optional[List[str]] = None
+        header: Optional[str] = None
+        prev_was_entry = False
+        for raw in (text or "").splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                if fence is None:
+                    fence, header = [], (entries.pop() if prev_was_entry else None)
+                else:
+                    entries.extend(cls._guest_progress_fenced_entry(header, fence))
+                    fence, header = None, None
+                prev_was_entry = False
+                continue
+            if fence is not None:
+                fence.append(raw)
+                continue
+            if stripped:
+                entries.append(stripped)
+            prev_was_entry = bool(stripped)
+        if fence is not None:
+            entries.extend(cls._guest_progress_fenced_entry(header, fence))
+        return [cls._shorten_guest_progress_line(entry) for entry in entries]
+
+    @staticmethod
+    def _guest_progress_fenced_entry(header: Optional[str], fence: List[str]) -> List[str]:
+        """``["💻 terminal: ls -la"]`` for a header plus its fenced command; [] when both are empty."""
+        body = " ".join(part.strip() for part in fence if part.strip())
+        entry = f"{header}: {body}" if header and body else (header or body)
+        return [entry] if entry else []
+
+    @classmethod
+    def _shorten_guest_progress_line(cls, line: str) -> str:
+        """Collapse whitespace and cap one action so three of them stay readable on a phone."""
+        collapsed = " ".join((line or "").split())
+        if len(collapsed) <= cls._GUEST_PROGRESS_LINE_MAX:
+            return collapsed
+        return collapsed[: cls._GUEST_PROGRESS_LINE_MAX - 1].rstrip() + "…"
+
+    def _record_guest_progress(
+        self, turn_key: Any, content: str, metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Fold one tool-progress send into *turn_key*'s card (actions plus iteration counter)."""
+        card = self._guest_progress_state(turn_key)
+        if card is None:
+            return
+        self._note_guest_progress_iteration(card, metadata)
+        entries = self._guest_progress_entries(content)
+        if not entries:
+            return
+        keep, actions = self._GUEST_PROGRESS_ACTIONS, card["actions"]
+        if len(entries) >= keep or not actions:
+            # Grouped progress (the default): the bubble is cumulative, so it already IS the history.
+            card["actions"] = entries[-keep:]
+        else:
+            # progress_grouping "separate" sends one line per tool — stitch the window together.
+            card["actions"] = (actions + [e for e in entries if e not in actions])[-keep:]
+
+    @staticmethod
+    def _note_guest_progress_iteration(card: Dict[str, Any], metadata: Optional[Dict[str, Any]]) -> None:
+        """Adopt the live iteration counter the gateway stamps onto progress metadata."""
+        count = (metadata or {}).get("agent_iteration")
+        if count is None:
+            return
+        from agent.session_activity import format_iteration_progress
+        card["iteration"] = format_iteration_progress(count, (metadata or {}).get("agent_max_iterations"))
+
+    @staticmethod
+    def _format_guest_elapsed(seconds: float) -> str:
+        """How long the turn has run, coarse enough that an idle minute costs a single edit."""
+        if seconds < 60:
+            whole = int(max(0.0, seconds)) // 10 * 10
+            return f"{whole}s" if whole else "<10s"
+        return f"{int(seconds // 60)} min"
+
+    def _render_guest_progress_card(self, card: Dict[str, Any]) -> str:
+        """The whole card: one status line, then the last few actions under it."""
+        status = [f"⏳ Working — {self._format_guest_elapsed(time.monotonic() - card['started'])}"]
+        if card.get("iteration"):
+            status.append(str(card["iteration"]))
+        body = "\n".join((card.get("actions") or [])[-self._GUEST_PROGRESS_ACTIONS:])
+        return " — ".join(status) + (f"\n\n{body}" if body else "")
+
+    async def _draw_guest_progress_card(self, turn_key: Any) -> None:
+        """Re-render *turn_key*'s message with its current progress, when that warrants an edit.
+
+        Gates, in order: the card must still own the surface (a control prompt drawn on it bumps
+        the generation and retires the card for good — its question is what the turn is now waiting
+        on), the throttle interval must have elapsed, and the text must differ from what is on
+        screen. A failed edit is logged and dropped: progress is never worth failing a turn over.
+        """
+        key = str(turn_key)
+        card = self._guest_progress_state(key)
+        if card is None or not self._bot or not self._telegram_guest_progress_card():
+            return
+        imi = self._guest_inline_message_ids.get(key)
+        if not isinstance(imi, str):
+            return  # stub not fired yet, or Telegram returned no inline message to edit
+        if self._guest_surface_generation(key) > card["gen"]:
+            self._close_guest_progress_card(key)
+            return
+        now = time.monotonic()
+        if now - card["last_edit"] < self._telegram_guest_progress_interval():
+            return
+        text = self._render_guest_progress_card(card)
+        if text == card["rendered"]:
+            return
+        # Throttle on the attempt, remember the text only once it is really on screen, so a
+        # failed edit is redrawn next interval instead of being assumed delivered.
+        card["last_edit"] = now
+        try:
+            await self._bot.edit_message_text(text=text, inline_message_id=imi)
+        except asyncio.CancelledError:
+            # The typing refresh abandons a slow tick on purpose; the next one redraws.
+            raise
+        except Exception as err:
+            logger.debug(
+                "[%s] guest progress card edit failed (turn=%s): %s",
+                self.name, key, _redact_telegram_error_text(err))
+            return
+        card["rendered"] = text
 
     # Answered questions kept above the pending one. Three keeps the card readable and well
     # inside Telegram's 4,096-character limit even with long questions.

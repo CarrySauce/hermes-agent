@@ -581,8 +581,31 @@ class TurnRunner:
             current = candidate
         return groups + ([current] if current else [])
 
+    def _stamp_progress_activity(self) -> None:
+        """Refresh the live iteration counter on the shared progress metadata.
+
+        A surface that renders progress as ONE message (Telegram guest mode: a single inline
+        message, and no second bubble to put a heartbeat in) has to show "iteration X/Y" on the
+        same card as the tool lines. The heartbeat that carries it everywhere else runs on its own
+        3-minute timer, so the counters are stamped here, where every progress line already passes.
+
+        A chat with no progress thread carries no metadata at all, so the dict is created when
+        there is something to put in it. Safe here and not earlier: ``_progress_edit_state`` has
+        already decided whether edits pass metadata, so materializing it cannot change that.
+        """
+        ctx = self._ctx
+        with suppress(Exception):
+            activity = self._runner._agent_activity_summary(ctx.agent_holder[0])
+            if activity.get("api_call_count") is None:
+                return
+            if ctx._progress_metadata is None:
+                ctx._progress_metadata = {}
+            ctx._progress_metadata["agent_iteration"] = activity["api_call_count"]
+            ctx._progress_metadata["agent_max_iterations"] = activity.get("max_iterations")
+
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        self._stamp_progress_activity()
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
