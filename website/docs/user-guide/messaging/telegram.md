@@ -1134,6 +1134,56 @@ unioned with the pairing store, `*` to open it to everyone). An empty allowlist 
 unrecognized caller is denied, and the denial is logged with the caller id. Sessions are keyed
 per caller exactly as they are for ordinary group messages.
 
+**Letting other people in (`guest_participation`).** By default an unknown caller is simply
+dropped: from their side the bot ignored them, and you never learn they tried. Turn participation
+on and that dead end becomes a request you can answer from your phone:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_participation: true              # default false
+        guest_approval_chat: "-1009876543210"  # default: your home channel
+```
+
+Env equivalents: `TELEGRAM_GUEST_PARTICIPATION`, `TELEGRAM_GUEST_APPROVAL_CHAT`.
+
+The stranger gets told someone has to let them in, on the message they asked from — and you get a
+card in **your own chat**:
+
+```
+🙋 someone wants to use me in Test Group.
+
+They tried to ask: “what's the weather in Lisbon?”
+
+User id: 1234567
+
+[ ✅ Allow ]  [ 🚫 Deny ]
+```
+
+It names who asked, which chat they asked from, what they were after, and the id you would revoke.
+A tap on a button they aren't allowed to use raises the same card, naming the action instead
+("answer a question on “Pick a word”"), since a tap tells you nothing about who they are.
+
+- **Allow** grants exactly what `hermes pairing approve` grants: a pairing-store approval, honoured
+  across every chat this bot serves and mirrored into `TELEGRAM_ALLOWED_USERS` when you have one
+  configured. Revoke it with `hermes pairing revoke telegram <id>`. Their waiting message changes
+  to say they can ask again — the request itself is not replayed, because a guest query is one-shot
+  and short-lived, so by the time you tap there is nothing left to answer with.
+- **Deny** tells them no and silences that person in that chat for a day, so a card cannot be made
+  to reappear by asking repeatedly.
+
+The card is only ever posted to your own chat, never to the chat that asked — it carries the button
+that grants access, so posting it there would let the asker approve themselves. If no approval chat
+is configured (no home channel, no `guest_approval_chat`) the request is skipped and the caller is
+denied exactly as before. Asking again while a request is open updates it rather than sending a
+second card, at most eight requests are pending at a time, and an unanswered one expires after 30
+minutes. Pending requests live in memory: a gateway restart clears them, and the person can ask
+again. Raising a request never authorizes anything — the caller is still denied, and whatever they
+send next runs through the same gate.
+
 **Attachments.** Images and files work in both directions:
 
 - **Inbound** — a photo, voice note, video or document sent with the @mention takes the same

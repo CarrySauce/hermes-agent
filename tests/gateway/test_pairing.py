@@ -722,3 +722,47 @@ class TestProfileScopedStorage:
         )
 
 
+
+
+class TestDirectUserApproval:
+    """``approve_user`` — an operator approving from a surface that already names the person.
+
+    The code flow exists to prove WHICH user asked; a tap on that person's own request has already
+    established it, so there is nothing to look up. What the grant means must not differ.
+    """
+
+    def test_approves_without_a_code_or_pending_request(self, tmp_path):
+        store = _make_store(tmp_path)
+
+        result = store.approve_user("telegram", "999", "someone")
+
+        assert result == {"user_id": "999", "user_name": "someone"}
+        assert store.is_approved("telegram", "999") is True
+        assert store.list_pending("telegram") == []
+
+    def test_the_grant_is_revocable_like_any_other(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.approve_user("telegram", "999", "someone")
+
+        assert store.revoke("telegram", "999") is True
+        assert store.is_approved("telegram", "999") is False
+
+    def test_mirrors_into_a_configured_allowlist(self, tmp_path):
+        """Same mirror as approving a code: the operator's list stays the visible source of truth."""
+        store = _make_store(tmp_path)
+        saved = {}
+        with patch("gateway.pairing._read_allowlist_env", return_value="111"), \
+             patch("gateway.pairing._write_allowlist_env", side_effect=lambda env, ids: saved.update({env: ids})):
+            store.approve_user("telegram", "999", "someone")
+
+        assert saved == {"TELEGRAM_ALLOWED_USERS": ["111", "999"]}
+
+    def test_an_empty_user_id_is_refused(self, tmp_path):
+        """A blank id would write an entry that authorizes the empty caller id every guest
+        message without ``from_user`` produces."""
+        store = _make_store(tmp_path)
+
+        with pytest.raises(ValueError):
+            store.approve_user("telegram", "  ")
+
+        assert store.list_approved("telegram") == []
