@@ -4812,9 +4812,16 @@ class TelegramAdapter(BasePlatformAdapter):
         data = query.data
         cb = self._callback_ctx(query)
         if getattr(query, "message", None) is None and cb["chat_id"] is None:
-            # A tap on an inline message we cannot attribute to a chat (gateway restart, or the
-            # bounded mapping aged out): there is no context to authorize against, so refuse.
-            # Falling through would hand the gate a chat-less, DM-shaped source.
+            # A participation tap needs no mapping: its callback data names the request and the
+            # request names the chat, so it authorizes against that. Routed here rather than after
+            # the refusal below because the refusal is what stopped live approval cards from
+            # working at all — Telegram handed back an inline_message_id the map did not hold.
+            if data.startswith("gp:"):
+                await self._handle_guest_participation_callback(query, data, cb)
+                return
+            # Every other prefix identifies its work by the surface it happened on, so an
+            # unattributable tap has no context to authorize against: refuse. Falling through would
+            # hand the gate a chat-less, DM-shaped source.
             logger.warning(
                 "[%s] callback on an unattributable inline message (imi=%s); refusing",
                 self.name, getattr(query, "inline_message_id", None))
@@ -7792,6 +7799,27 @@ class TelegramAdapter(BasePlatformAdapter):
         """Whether an unauthorized guest caller gets an approval request instead of a silent deny."""
         return self._extra_bool("guest_participation", "TELEGRAM_GUEST_PARTICIPATION", "false")
 
+    def _telegram_guest_participation_allow_always(self) -> bool:
+        """Whether the card also offers permanent access, not just this one request.
+
+        Off by default because the grant is not "let them ask me things": it is operator-level
+        access in every chat this bot serves, which also lets that person answer exec approvals and
+        clarify prompts and DM the bot with the full toolset. One tap is a lot to hand out by
+        accident, so the default card can only let the request in front of it through.
+        """
+        return self._extra_bool(
+            "guest_participation_allow_always", "TELEGRAM_GUEST_PARTICIPATION_ALLOW_ALWAYS", "false")
+
+    def _telegram_guest_participation_operator_copy(self) -> bool:
+        """Whether each request also posts a copy to the operator's own chat.
+
+        On by default, since an operator who is not in the asking group would otherwise never see
+        it. Off leaves the in-chat card as the only surface, which only an authorized user who is
+        in that group can resolve.
+        """
+        return self._extra_bool(
+            "guest_participation_operator_copy", "TELEGRAM_GUEST_PARTICIPATION_OPERATOR_COPY", "true")
+
     def _guest_approval_chat_id(self) -> str:
         """The operator's own chat, where approval cards are posted.
 
@@ -7828,15 +7856,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return f"{action} on “{prompt}”" if prompt else action
 
     def _guest_participation_keyboard(self, request_id: str) -> Any:
-        """Allow/Deny for one request; the same buttons go on both cards.
+        """The decisions for one request; the same buttons go on both copies of its card.
 
-        Safe in the chat that asked because a tap is gated on who pressed it: the stranger who
-        raised the request is refused by the same gate that refused their message.
+        ``Allow once`` runs the request in front of it and grants nothing. ``Allow always`` is the
+        durable grant and is offered only when ``guest_participation_allow_always`` is on. Safe in
+        the chat that asked because a tap is gated on who pressed it: the stranger who raised the
+        request is refused by the same gate that refused their message.
         """
-        return InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Allow", callback_data=f"gp:a:{request_id}"),
-            InlineKeyboardButton("🚫 Deny", callback_data=f"gp:d:{request_id}"),
-        ]])
+        allow = [InlineKeyboardButton("✅ Allow once", callback_data=f"gp:o:{request_id}")]
+        if self._telegram_guest_participation_allow_always():
+            allow.append(InlineKeyboardButton("♾️ Allow always", callback_data=f"gp:a:{request_id}"))
+        return InlineKeyboardMarkup(
+            [allow, [InlineKeyboardButton("🚫 Deny", callback_data=f"gp:d:{request_id}")]])
 
     def _guest_participation_slot(self, chat_id: Any, user_id: Any) -> str:
         """Identity of a would-be participant: one open request per person per chat."""
@@ -7923,6 +7954,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def _guest_participation_card_footer(self) -> str:
+        """What the buttons on this card will do, in the operator's own words for the decision.
+
+        Kept next to the keyboard that it describes: offering permanent access without saying what
+        it costs is how a single tap becomes an operator-level grant nobody meant to make.
+        """
+        footer = (
+            "<b>Allow once</b> runs just this request, as them. It grants nothing: their next "
+            "message is refused again."
+        )
+        if self._telegram_guest_participation_allow_always():
+            footer += (
+                "\n\n<b>Allow always</b> gives them the same access as "
+                "<code>hermes pairing approve</code> — every chat this bot serves, until you revoke it."
+            )
+        return footer
+
     async def _post_guest_approval_card(self, request_id: str, record: Dict[str, Any]) -> bool:
         """Put the operator's copy of the card in their own chat; False when it did not go out.
 
@@ -7930,6 +7978,8 @@ class TelegramAdapter(BasePlatformAdapter):
         id they were not given. The in-chat copy (``_answer_guest_participation_wait``) is the one
         that lives there, and it carries the same buttons.
         """
+        if not self._telegram_guest_participation_operator_copy():
+            return False  # Turned off: the in-chat card is the only surface, by choice.
         approval_chat = str(self._guest_approval_chat_id() or "").strip()
         if not approval_chat:
             logger.info(
@@ -7947,8 +7997,7 @@ class TelegramAdapter(BasePlatformAdapter):
             f"🙋 <b>{_html.escape(who)}</b> wants to use me in <b>{_html.escape(str(where))}</b>.\n\n"
             f"They tried to {_html.escape(record['what'])}\n\n"
             f"User id: <code>{_html.escape(record['user_id'])}</code>\n\n"
-            "<b>Allow</b> gives them the same access as <code>hermes pairing approve</code> — "
-            "every chat this bot serves, until you revoke it."
+            + self._guest_participation_card_footer()
         )
         try:
             sent = await self._bot.send_message(
@@ -7993,6 +8042,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if inline_message_id:
             record["inline_message_id"] = str(inline_message_id)
             self._remember_guest_inline_message(record["chat_id"], str(inline_message_id))
+        # Logged because a tap that arrives with a DIFFERENT id is otherwise indistinguishable from
+        # a lost map entry, and the two have different fixes. Taps no longer depend on the map
+        # (``_handle_guest_participation_callback`` reads the chat off the request), so this is a
+        # diagnostic, not a guard.
+        logger.debug(
+            "[%s] Guest participation card drawn (request=%s imi=%s)",
+            self.name, request_id, inline_message_id)
 
     def _guest_grant_scope(self) -> tuple:
         """``(hermes home, profile name)`` of the pairing store this gateway actually reads."""
@@ -8035,21 +8091,15 @@ class TelegramAdapter(BasePlatformAdapter):
             "[%s] Guest participation granted to user %s by an operator tap", self.name, user_id)
         return True
 
-    async def _close_guest_participation_card(
-        self, record: Dict[str, Any], *, granted: bool) -> None:
-        """Land the decision on the message in the chat that asked, buttons removed.
+    async def _close_guest_participation_card(self, record: Dict[str, Any], text: str) -> None:
+        """Land *text* on the message in the chat that asked, buttons removed.
 
-        Only for the outcomes the turn does not take over: a grant whose request could not be run,
-        and every denial. ``editMessageText`` with no ``reply_markup`` drops the keyboard, so the
-        Allow button cannot be tapped again.
+        Only for the outcomes a replayed turn does not take over. ``editMessageText`` with no
+        ``reply_markup`` drops the keyboard, so no decision can be tapped twice.
         """
         inline_message_id = record.get("inline_message_id")
         if not inline_message_id or not self._bot:
             return
-        text = (
-            "✅ You're in — @mention me again and I'll answer."
-            if granted else
-            "🚫 Sorry — my owner would rather I didn't help here.")
         try:
             await self._bot.edit_message_text(text=text, inline_message_id=str(inline_message_id))
         except Exception as exc:
@@ -8090,71 +8140,136 @@ class TelegramAdapter(BasePlatformAdapter):
             inline_message_id=str(inline_message_id))
 
     async def _handle_guest_participation_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
-        """``gp:<a|d>:<request_id>`` — the operator letting a guest caller in, or not.
+        """``gp:<o|a|d>:<request_id>`` — allow this one request, allow always, or deny.
 
         Gated on the ordinary callback allowlist with the participation fallback switched OFF: the
         stranger who raised this request can see these buttons (one copy sits in their own chat), so
         their tap must be the flat refusal and must not rewrite the very request it is asking about.
+
+        The gate runs against the chat the REQUEST names, not the chat the tap arrived from. A tap
+        on the in-chat copy is an inline-message callback, which carries no chat of its own, and
+        making it depend on the inline-message→chat map is what refused live cards as
+        "unattributable" in production. The callback data names the request; the request names the
+        chat. Read before claimed, so a refused tap leaves the request for whoever may decide it.
         """
         parts = data.split(":", 2)
         if len(parts) != 3:
             return
         choice, request_id = parts[1], parts[2]
-        if not await self._callback_authorized(query, cb, _UNAUTHORIZED, participation=False):
-            return
         self._prune_guest_participation()
-        # Popped, so the two copies of this card resolve it once between them.
-        record = self._guest_participation_requests.pop(request_id, None)
+        record = self._guest_participation_requests.get(request_id)
         if record is None:
             await query.answer(text="Already handled, or the request expired.")
             await self._edit_md_quiet(query, "⌛ This request expired or was already handled.")
+            return
+        if not await self._callback_authorized(
+            query, self._guest_participation_gate_ctx(cb, record), _UNAUTHORIZED, participation=False,
+        ):
+            return
+        # Claimed only now, and only once: the two copies of this card share one decision.
+        if self._guest_participation_requests.pop(request_id, None) is None:
+            await query.answer(text="Already handled, or the request expired.")
             return
         # Which copy was tapped: the one in the chat that asked is also the surface an approved
         # request is answered on, so the turn — not this handler — writes it.
         tapped = str(getattr(query, "inline_message_id", None) or "")
         on_guest_card = bool(tapped) and tapped == str(record.get("inline_message_id") or "")
-        who = record["user_name"] or f"user {record['user_id']}"
-        operator = getattr(query.from_user, "first_name", "an operator")
-        if choice == "a":
-            granted = await self._grant_guest_participation(record["user_id"], record["user_name"])
-            # Run what they asked for, right here on the card. Only once the grant is real: a
-            # replay on a failed grant would answer someone the operator has not actually let in.
-            replayed = await self._replay_guest_request(record) if granted else False
-            label = f"✅ Allowed {who}" if granted else "⚠️ Could not save that grant"
-            detail = (
-                f"✅ {who} was allowed by {operator}."
-                + (" Their request is running." if replayed else " They can ask again.")
-                if granted else
-                f"⚠️ {who} could NOT be allowed — saving the grant failed, so they are still "
-                "blocked. See the gateway log, then try again or run `hermes pairing approve`.")
-            await query.answer(text=label)
-            await self._resolve_guest_participation_cards(
-                query, record, detail, on_guest_card=on_guest_card,
-                # Replayed: the turn owns that message from here on, and writing "allowed" over it
-                # would race its first edit.
-                close_guest_card=None if replayed else granted)
+        if choice in ("o", "a"):
+            await self._allow_guest_participation(
+                query, request_id, record, always=choice == "a", on_guest_card=on_guest_card)
             return
         # Denied: stamp the person so they cannot make this card reappear for a day.
         self._guest_participation_declined[record["slot"]] = time.time()
+        who = record["user_name"] or f"user {record['user_id']}"
+        operator = getattr(query.from_user, "first_name", "an operator")
         await query.answer(text=f"🚫 Denied {who}")
         await self._resolve_guest_participation_cards(
-            query, record, f"🚫 {who} was denied by {operator}.",
-            on_guest_card=on_guest_card, close_guest_card=False)
+            query, record, f"🚫 {who} was denied by {operator}.", on_guest_card=on_guest_card,
+            guest_card_text="🚫 Sorry — my owner would rather I didn't help here.")
+
+    @staticmethod
+    def _guest_participation_gate_ctx(cb: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
+        """Callback context for the gate, with the request's own chat filled in where the tap has none."""
+        gate = dict(cb or {})
+        if gate.get("chat_id") is None:
+            gate["chat_id"], gate["chat_type"] = record["chat_id"], record["chat_type"]
+        gate.setdefault("thread_id", None)
+        gate.setdefault("user_name", None)
+        return gate
+
+    async def _allow_guest_participation(
+        self, query, request_id: str, record: Dict[str, Any], *, always: bool,
+        on_guest_card: bool) -> None:
+        """Resolve an Allow tap: run this one request, or hand out durable access first.
+
+        ``always`` is checked against the setting again here. A card drawn while permanent access
+        was on outlives the setting being turned off, and a stale button must not still make the
+        grant it was labelled with.
+        """
+        who = record["user_name"] or f"user {record['user_id']}"
+        operator = getattr(query.from_user, "first_name", "an operator")
+        if always and not self._telegram_guest_participation_allow_always():
+            # Put the request back and leave both cards as they are: the operator's intent cannot
+            # be honoured, but Allow once on this same card still can, and consuming the request
+            # would make the person ask again for nothing.
+            self._guest_participation_requests.setdefault(request_id, record)
+            logger.warning(
+                "[%s] Stale 'Allow always' tap refused, permanent access is off (request=%s user=%s)",
+                self.name, request_id, record["user_id"])
+            await query.answer(
+                text="Permanent access is turned off for this bot — use Allow once.", show_alert=True)
+            return
+        # Allow once grants nothing: it authorizes the one request in front of the operator and
+        # nothing else, so the person's next message is refused again. Allow always writes the
+        # durable grant first, and a replay on a failed write would answer someone who is still
+        # blocked — so it never runs.
+        granted = await self._grant_guest_participation(record["user_id"], record["user_name"]) if always else True
+        replayed = await self._replay_guest_request(record) if granted else False
+        if not granted:
+            await query.answer(text="⚠️ Could not save that grant")
+            await self._resolve_guest_participation_cards(
+                query, record,
+                f"⚠️ {who} could NOT be allowed — saving the grant failed, so they are still "
+                "blocked. See the gateway log, then try again or run `hermes pairing approve`.",
+                on_guest_card=on_guest_card,
+                guest_card_text="🚫 Sorry — something went wrong on my side. Try me again later.")
+            return
+        if always:
+            await query.answer(text=f"✅ Allowed {who}")
+            detail = f"✅ {who} was allowed by {operator} — permanently." + (
+                " Their request is running." if replayed else " They can ask again.")
+            # Not replayed: the turn never took the message over, so the card has to say something.
+            guest_card_text = None if replayed else "✅ You're in — @mention me again and I'll answer."
+        elif replayed:
+            await query.answer(text=f"✅ Running it for {who}")
+            detail = f"✅ {operator} allowed one request from {who}. It is running now."
+            guest_card_text = None
+        else:
+            # Nothing left to run: the request outlived its payload (a restart drops it) or it came
+            # from a button tap, which cannot be replayed. Granting nothing is the point of Allow
+            # once, so there is no fallback — they ask again and a fresh card is raised.
+            await query.answer(text="⌛ Nothing left to run")
+            detail = (
+                f"⌛ Nothing left to run for {who} — that request is gone. They can ask again, "
+                "and you'll get a fresh card.")
+            guest_card_text = "⌛ That request expired — @mention me again."
+        await self._resolve_guest_participation_cards(
+            query, record, detail, on_guest_card=on_guest_card, guest_card_text=guest_card_text)
 
     async def _resolve_guest_participation_cards(
         self, query, record: Dict[str, Any], detail: str, *, on_guest_card: bool,
-        close_guest_card: Optional[bool],
+        guest_card_text: Optional[str],
     ) -> None:
-        """Leave no live Allow button behind, on either copy of a resolved request.
+        """Leave no live button behind, on either copy of a resolved request.
 
-        ``close_guest_card`` is the decision to show in the chat that asked, or None when the turn
-        has taken that message over. The tapped copy is updated through ``query``; the other one by
-        its recorded id.
+        ``guest_card_text`` is what to show in the chat that asked, or None when a replayed turn has
+        taken that message over — writing anything then would race its first edit. The tapped copy
+        is updated through ``query``; the other one by its recorded id.
         """
         if not on_guest_card:
             await self._edit_md_quiet(query, detail)
-        if close_guest_card is not None:
-            await self._close_guest_participation_card(record, granted=close_guest_card)
+        if guest_card_text is not None:
+            await self._close_guest_participation_card(record, guest_card_text)
         if on_guest_card:
             await self._close_guest_operator_card(record, detail)
 
@@ -8432,9 +8547,9 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._answer_guest_query(
             guest_query_id,
             InlineQueryResultArticle(
-                id="busy", title="Still working on the previous request",
+                id="busy", title="Still working on an earlier request",
                 input_message_content=InputTextMessageContent(
-                    "⏳ Still working on a previous request in this chat — please wait for that reply, then ask again."),
+                    "⏳ Still working on an earlier request — please wait for that reply, then ask again."),
             ),
             log_label="busy-reply",
         )

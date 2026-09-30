@@ -1144,11 +1144,14 @@ gateway:
     telegram:
       extra:
         guest_mode: true
-        guest_participation: true              # default false
-        guest_approval_chat: "-1009876543210"  # default: your home channel
+        guest_participation: true                 # default false
+        guest_participation_allow_always: false   # default false — see "Allow always" below
+        guest_participation_operator_copy: true   # default true
+        guest_approval_chat: "-1009876543210"     # default: your home channel
 ```
 
-Env equivalents: `TELEGRAM_GUEST_PARTICIPATION`, `TELEGRAM_GUEST_APPROVAL_CHAT`.
+Env equivalents: `TELEGRAM_GUEST_PARTICIPATION`, `TELEGRAM_GUEST_PARTICIPATION_ALLOW_ALWAYS`,
+`TELEGRAM_GUEST_PARTICIPATION_OPERATOR_COPY`, `TELEGRAM_GUEST_APPROVAL_CHAT`.
 
 The card goes to **both ends**, because you might be in either. In the chat that asked, on the
 message they asked from:
@@ -1157,7 +1160,8 @@ message they asked from:
 🙋 I don't know you yet — my owner has to let me answer here. I've asked them,
 and they can also decide right here. Only they can use these buttons.
 
-[ ✅ Allow ]  [ 🚫 Deny ]
+[ ✅ Allow once ]
+[ 🚫 Deny ]
 ```
 
 and in **your own chat**, with the detail you need if you are not in that group:
@@ -1169,31 +1173,51 @@ They tried to ask: “what's the weather in Lisbon?”
 
 User id: 1234567
 
-[ ✅ Allow ]  [ 🚫 Deny ]
+Allow once runs just this request, as them. It grants nothing: their next
+message is refused again.
+
+[ ✅ Allow once ]
+[ 🚫 Deny ]
 ```
 
 Either copy resolves the request, and resolving one clears the other's buttons. So if you are in
-the group, you just tap **Allow** in place — no switching chats.
+the group, you just tap in place — no switching chats.
 
 A tap on a button they aren't allowed to use raises the same card, naming the action instead
 ("answer a question on “Pick a word”"), since a tap tells you nothing about who they are.
 
-- **Allow** grants exactly what `hermes pairing approve` grants: a pairing-store approval, honoured
-  across every chat this bot serves and mirrored into `TELEGRAM_ALLOWED_USERS` when you have one
-  configured. Revoke it with `hermes pairing revoke telegram <id>`. Then their request **runs, on
-  that same message** — the card becomes the progress card and then the reply, exactly where they
-  asked. If the turn can't start (that conversation is already working, or message gating refused
-  it) the card says they can ask again instead. A grant that fails to save runs nothing: the grant
-  is the authorization.
+- **Allow once** runs that one request **on that same message** — the card becomes the progress
+  card and then the reply, exactly where they asked — and grants nothing at all: no pairing-store
+  entry, no `.env` write, and their next message is gated again into a fresh card. If there is
+  nothing left to run (a gateway restart dropped the pending request, or it came from a button tap,
+  which cannot be replayed) the card says so and still grants nothing.
 - **Deny** tells them no and silences that person in that chat for a day, so a card cannot be made
   to reappear by asking repeatedly.
+- **Allow always** is the durable grant and appears only with
+  `guest_participation_allow_always: true`, because it is not "let them ask me things": it grants
+  exactly what `hermes pairing approve` grants — every chat this bot serves, mirrored into
+  `TELEGRAM_ALLOWED_USERS` when you have one configured, which also lets that person answer exec
+  approvals and clarify prompts and DM the bot with the full toolset. Revoke with
+  `hermes pairing revoke telegram <id>`. A card drawn while the setting was on cannot still make
+  the grant after you turn it off.
+
+**What Allow once does not do.** It authorizes the one request in front of you and nothing else, so
+inside that turn the guest is still an unauthorized user: a clarify question or an exec approval
+raised by their own request is answerable only by someone already allowed, and a typed answer from
+them is refused. Use **Allow always** for anyone who needs a back-and-forth.
 
 **Why in-chat buttons are safe.** A tap is authorized on *who pressed it*, never on where the
 button sits: the stranger who raised the request is refused by the very gate that refused their
-message, and their tap can't rewrite the request it is asking about. What is never posted into the
-chat that asked is *your* copy — it names the chat, which would hand them an id they were not
-given. You need no home channel at all if you are in the group; with neither surface reachable the
-request is dropped and the caller is denied as before.
+message, and their tap can't rewrite the request it is asking about. The chat that tap is judged
+against is the one the *request* names, not the one the tap arrived from — an in-chat card is an
+inline message and carries no chat of its own. What is never posted into the chat that asked is
+*your* copy: it names the chat, which would hand them an id they were not given.
+
+Set `guest_participation_operator_copy: false` to skip your copy entirely and leave the in-chat
+card as the only surface — useful when the home channel is busy with other things. Then only an
+authorized user who is **in that group** can resolve a request. You equally need no home channel at
+all if you are in the group; with neither surface reachable the request is dropped and the caller is
+denied as before.
 
 Asking again while a request is open updates it rather than sending a second card, at most eight
 requests are pending at a time, and an unanswered one expires after 30 minutes. Pending requests

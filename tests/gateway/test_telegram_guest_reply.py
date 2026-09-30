@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2712,9 +2713,11 @@ async def test_a_failed_guest_progress_edit_is_redrawn_next_interval():
 _OWNER_CHAT = "-100777"
 
 
-def _participation_adapter(extra=None, *, owner_chat=_OWNER_CHAT):
+def _participation_adapter(extra=None, *, owner_chat=_OWNER_CHAT, allow_always=False):
     adapter = _make_adapter()
-    adapter.config.extra.update({"guest_participation": True, "guest_staging_chat": owner_chat})
+    adapter.config.extra.update({
+        "guest_participation": True, "guest_staging_chat": owner_chat,
+        "guest_participation_allow_always": allow_always})
     adapter.config.extra.update(extra or {})
     adapter._bot.send_message = AsyncMock()
     adapter._bot.answer_guest_query = AsyncMock(
@@ -2742,8 +2745,12 @@ def _request_id(adapter):
     return next(iter(adapter._guest_participation_requests))
 
 
+def _keyboard_buttons(markup):
+    return {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
+
+
 def _buttons(adapter):
-    return {b.text: b.callback_data for b in _owner_card(adapter)["reply_markup"].inline_keyboard[0]}
+    return _keyboard_buttons(_owner_card(adapter)["reply_markup"])
 
 
 @pytest.mark.asyncio
@@ -2770,10 +2777,11 @@ async def test_an_unknown_caller_becomes_a_request_to_the_operator():
     # Still denied: no turn registered, nothing routed to the agent.
     should_process.assert_not_called()
     assert adapter._pending_guest_queries == {}
-    # The operator's own chat got the card, with both decisions on it.
+    # The operator's own chat got the card, with the decisions on it. No permanent grant by
+    # default: one tap must not be able to hand out operator-level access by accident.
     assert str(_owner_card(adapter)["chat_id"]) == _OWNER_CHAT
-    assert _buttons(adapter) == {
-        "✅ Allow": f"gp:a:{_request_id(adapter)}", "🚫 Deny": f"gp:d:{_request_id(adapter)}"}
+    rid = _request_id(adapter)
+    assert _buttons(adapter) == {"✅ Allow once": f"gp:o:{rid}", "🚫 Deny": f"gp:d:{rid}"}
 
 
 @pytest.mark.asyncio
@@ -2800,8 +2808,9 @@ async def test_the_card_in_the_chat_that_asked_carries_the_same_buttons():
     result = adapter._bot.answer_guest_query.await_args.args[1]
     assert result.id == "participation"
     assert "only they can use these buttons" in result.input_message_content.message_text.lower()
-    assert {b.text: b.callback_data for b in result.reply_markup.inline_keyboard[0]} == {
-        "✅ Allow": f"gp:a:{_request_id(adapter)}", "🚫 Deny": f"gp:d:{_request_id(adapter)}"}
+    rid = _request_id(adapter)
+    assert _keyboard_buttons(result.reply_markup) == {
+        "✅ Allow once": f"gp:o:{rid}", "🚫 Deny": f"gp:d:{rid}"}
     # Kept, because it is also the surface an approved request is answered on.
     assert adapter._guest_participation_requests[_request_id(adapter)]["inline_message_id"] == "imi_wait"
 
@@ -2923,38 +2932,65 @@ def _guest_card_tap(adapter, *, data, imi="imi_wait"):
 
 
 @pytest.mark.asyncio
-async def test_allow_grants_the_access_hermes_pairing_approve_grants(participation_home):
-    """Not a Telegram-only side door: the pairing store is what the auth chain reads."""
-    from gateway.pairing import PairingStore
-
-    adapter = _participation_adapter()
-    await _unauthorized_mention(adapter)
-    query = _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}")
-
-    await _resolve(adapter, query)
-
-    assert PairingStore().is_approved("telegram", "999") is True
-    assert adapter._guest_participation_requests == {}
-    assert "allowed" in query.edit_message_text.await_args.kwargs["text"].lower()
-
-
-@pytest.mark.asyncio
-async def test_allow_runs_the_request_on_the_card_that_was_tapped(participation_home):
-    """What the operator approves is the request, not just the person: the turn adopts the message
-    the card lives on, so the answer lands right there instead of asking them to repeat themselves."""
+async def test_allow_once_runs_the_request_on_the_card_that_was_tapped(participation_home):
+    """What the operator approves is the request, not the person: the turn adopts the message the
+    card lives on, so the answer lands right there instead of asking them to repeat themselves."""
     adapter = _participation_adapter()
     await _unauthorized_mention(adapter, text="@testbot what's the weather?")
     enqueued = []
 
     with patch.object(adapter, "_should_process_message", return_value=True), \
          patch.object(adapter, "_enqueue_text_event", side_effect=enqueued.append):
-        await _resolve(adapter, _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}"))
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:o:{_request_id(adapter)}"))
 
     # The turn is live on the message the person is already looking at.
     assert adapter._guest_inline_message_ids == {"42": "imi_wait"}
     assert adapter._guest_live_turn_keys("42") == ["42"]
     # And it carries what they actually asked.
     assert len(enqueued) == 1 and "weather" in enqueued[0].text
+
+
+@pytest.mark.asyncio
+async def test_allow_once_grants_nothing_at_all(participation_home):
+    """The whole point: it is one request, not operator-level access to every chat this bot
+    serves — which is what the pairing store and the allowlist mirror hand out."""
+    from gateway.pairing import PairingStore
+
+    adapter = _participation_adapter()
+    await _unauthorized_mention(adapter)
+    env_writes = []
+
+    with patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_enqueue_text_event"), \
+         patch("gateway.pairing._write_allowlist_env", side_effect=lambda *a: env_writes.append(a)):
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:o:{_request_id(adapter)}"))
+
+    assert PairingStore().is_approved("telegram", "999") is False
+    assert PairingStore().list_approved("telegram") == []
+    assert env_writes == []
+
+
+@pytest.mark.asyncio
+async def test_after_allow_once_the_next_mention_is_a_fresh_request(participation_home):
+    """Gated again, exactly as if nothing had been approved."""
+    adapter = _participation_adapter()
+    await _unauthorized_mention(adapter, update_id=541, gqid="gq_a")
+    first = _request_id(adapter)
+
+    with patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_enqueue_text_event"):
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:o:{first}"))
+    assert adapter._guest_participation_requests == {}
+    # The replayed turn still owns the chat; end it so the next mention is not the busy reply.
+    for live in adapter._guest_live_turn_keys("42"):
+        adapter._release_guest_turn(live)
+    adapter._bot.send_message.reset_mock()
+
+    await _unauthorized_mention(adapter, update_id=542, gqid="gq_b")
+
+    assert len(adapter._guest_participation_requests) == 1
+    assert _request_id(adapter) != first
+    adapter._bot.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2966,35 +3002,39 @@ async def test_an_approved_request_is_not_overwritten_by_the_decision_text(parti
 
     with patch.object(adapter, "_should_process_message", return_value=True), \
          patch.object(adapter, "_enqueue_text_event"):
-        await _resolve(adapter, _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}"))
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:o:{_request_id(adapter)}"))
 
     assert adapter._bot.edit_message_text.await_args_list == []
 
 
 @pytest.mark.asyncio
-async def test_an_approval_whose_request_cannot_run_tells_the_caller_to_ask_again(participation_home):
-    """Gating refused it, or that conversation is busy — the grant still stands."""
+async def test_allow_once_with_nothing_left_to_run_grants_nothing(participation_home):
+    """A restart drops the payload, and a tap-raised request never had one. Allow once has no
+    fallback by design: they ask again and a fresh card is raised."""
+    from gateway.pairing import PairingStore
+
     adapter = _participation_adapter()
     await _unauthorized_mention(adapter)
+    adapter._guest_participation_requests[_request_id(adapter)]["replay"] = None
 
-    with patch.object(adapter, "_should_process_message", return_value=False):
-        await _resolve(adapter, _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}"))
+    await _resolve(adapter, _owner_tap(adapter, data=f"gp:o:{_request_id(adapter)}"))
 
     edit = adapter._bot.edit_message_text.await_args.kwargs
-    assert edit["inline_message_id"] == "imi_wait" and "You're in" in edit["text"]
+    assert edit["inline_message_id"] == "imi_wait" and "expired" in edit["text"].lower()
     assert adapter._guest_live_turn_keys("42") == []
+    assert PairingStore().is_approved("telegram", "999") is False
 
 
 @pytest.mark.asyncio
 async def test_approving_from_the_in_chat_card_clears_the_operators_copy(participation_home):
-    """Either copy resolves the request, and neither is left with a live Allow button."""
+    """Either copy resolves the request, and neither is left with a live button."""
     adapter = _participation_adapter()
     await _unauthorized_mention(adapter)
     adapter._bot.send_message.return_value = MagicMock(message_id=4242)
     # Re-raise so the record carries the operator message id the mock now returns.
     adapter._guest_participation_requests.clear()
     await _unauthorized_mention(adapter, update_id=599, gqid="gq_z")
-    query = _guest_card_tap(adapter, data=f"gp:a:{_request_id(adapter)}")
+    query = _guest_card_tap(adapter, data=f"gp:o:{_request_id(adapter)}")
 
     with patch.object(adapter, "_should_process_message", return_value=True), \
          patch.object(adapter, "_enqueue_text_event"):
@@ -3003,7 +3043,97 @@ async def test_approving_from_the_in_chat_card_clears_the_operators_copy(partici
     # The tapped copy is left to the turn; the operator's copy is edited by its recorded id.
     query.edit_message_text.assert_not_awaited()
     cleared = adapter._bot.edit_message_text.await_args.kwargs
-    assert cleared["message_id"] == 4242 and "allowed" in cleared["text"].lower()
+    assert cleared["message_id"] == 4242 and "running" in cleared["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Allow always — the durable grant, behind its own setting
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_allow_always_is_not_offered_by_default():
+    adapter = _participation_adapter()
+
+    await _unauthorized_mention(adapter)
+
+    assert "♾️ Allow always" not in _buttons(adapter)
+    result = adapter._bot.answer_guest_query.await_args.args[1]
+    assert "♾️ Allow always" not in _keyboard_buttons(result.reply_markup)
+    # And the card does not describe access it cannot hand out.
+    assert "pairing approve" not in _owner_card(adapter)["text"]
+
+
+@pytest.mark.asyncio
+async def test_allow_always_grants_the_access_hermes_pairing_approve_grants(participation_home):
+    """Not a Telegram-only side door: the pairing store is what the auth chain reads."""
+    from gateway.pairing import PairingStore
+
+    adapter = _participation_adapter(allow_always=True)
+    await _unauthorized_mention(adapter)
+    rid = _request_id(adapter)
+    assert _buttons(adapter)["♾️ Allow always"] == f"gp:a:{rid}"
+    assert "pairing approve" in _owner_card(adapter)["text"]
+    query = _owner_tap(adapter, data=f"gp:a:{rid}")
+
+    with patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_enqueue_text_event"):
+        await _resolve(adapter, query)
+
+    assert PairingStore().is_approved("telegram", "999") is True
+    assert adapter._guest_participation_requests == {}
+    assert "permanently" in query.edit_message_text.await_args.kwargs["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_allow_always_button_cannot_grant_after_the_setting_is_turned_off(participation_home):
+    """A card outlives the config it was drawn from, and the operator turning permanent access off
+    is exactly when a leftover button must not still make that grant."""
+    from gateway.pairing import PairingStore
+
+    adapter = _participation_adapter(allow_always=True)
+    await _unauthorized_mention(adapter)
+    rid = _request_id(adapter)
+    adapter.config.extra["guest_participation_allow_always"] = False
+
+    query = _owner_tap(adapter, data=f"gp:a:{rid}")
+    await _resolve(adapter, query)
+
+    assert PairingStore().is_approved("telegram", "999") is False
+    assert adapter._guest_live_turn_keys("42") == []
+    assert "use allow once" in query.answer.await_args.kwargs["text"].lower()
+    # The request survives: the operator's intent could not be honoured, but Allow once on this
+    # same card still can, so consuming it would make the person ask again for nothing.
+    assert _request_id(adapter) == rid
+
+
+@pytest.mark.asyncio
+async def test_allow_always_still_runs_the_request_it_was_tapped_on(participation_home):
+    adapter = _participation_adapter(allow_always=True)
+    await _unauthorized_mention(adapter, text="@testbot what's the weather?")
+    enqueued = []
+
+    with patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_enqueue_text_event", side_effect=enqueued.append):
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}"))
+
+    assert adapter._guest_inline_message_ids == {"42": "imi_wait"}
+    assert len(enqueued) == 1 and "weather" in enqueued[0].text
+
+
+@pytest.mark.asyncio
+async def test_allow_always_whose_request_cannot_run_still_grants(participation_home):
+    """Gating refused it or that conversation is busy — the grant stands, they ask again."""
+    from gateway.pairing import PairingStore
+
+    adapter = _participation_adapter(allow_always=True)
+    await _unauthorized_mention(adapter)
+
+    with patch.object(adapter, "_should_process_message", return_value=False):
+        await _resolve(adapter, _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}"))
+
+    assert PairingStore().is_approved("telegram", "999") is True
+    edit = adapter._bot.edit_message_text.await_args.kwargs
+    assert edit["inline_message_id"] == "imi_wait" and "You're in" in edit["text"]
 
 
 @pytest.mark.asyncio
@@ -3017,7 +3147,7 @@ async def test_a_stranger_tapping_the_in_chat_allow_button_is_refused(participat
     # Someone allowed is using the bot in that chat, so it IS a guest chat — which is what would
     # otherwise route this refused tap into the participation fallback.
     _register_guest_chat(adapter)
-    query = _tap(adapter, data=f"gp:a:{rid}", imi="imi_wait")  # from_user id 999 — the asker
+    query = _tap(adapter, data=f"gp:o:{rid}", imi="imi_wait")  # from_user id 999 — the asker
 
     with patch.object(adapter, "_is_callback_user_authorized", return_value=False):
         await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
@@ -3031,7 +3161,7 @@ async def test_a_stranger_tapping_the_in_chat_allow_button_is_refused(participat
 @pytest.mark.asyncio
 async def test_a_grant_that_cannot_be_saved_says_so_rather_than_claiming_success(participation_home):
     """Reporting "allowed" while the person is still blocked is the one outcome nobody can debug."""
-    adapter = _participation_adapter()
+    adapter = _participation_adapter(allow_always=True)
     await _unauthorized_mention(adapter)
     query = _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}")
 
@@ -3041,14 +3171,14 @@ async def test_a_grant_that_cannot_be_saved_says_so_rather_than_claiming_success
 
     detail = query.edit_message_text.await_args.kwargs["text"]
     assert "could not" in detail.lower() and "still" in detail.lower()
-    assert "Sorry" in adapter._bot.edit_message_text.await_args.kwargs["text"]
+    assert "went wrong" in adapter._bot.edit_message_text.await_args.kwargs["text"]
 
 
 @pytest.mark.asyncio
 async def test_a_failed_grant_does_not_run_the_request_anyway(participation_home):
     """Answering someone the operator has not actually let in is the one thing worse than
     reporting the failure: the grant is the authorization, so no grant means no turn."""
-    adapter = _participation_adapter()
+    adapter = _participation_adapter(allow_always=True)
     await _unauthorized_mention(adapter)
 
     with patch.object(adapter, "_grant_guest_participation", new_callable=AsyncMock, return_value=False), \
@@ -3083,7 +3213,7 @@ async def test_a_stranger_cannot_approve_themselves(participation_home):
 
     adapter = _participation_adapter()
     await _unauthorized_mention(adapter)
-    query = _owner_tap(adapter, data=f"gp:a:{_request_id(adapter)}")
+    query = _owner_tap(adapter, data=f"gp:o:{_request_id(adapter)}")
     query.from_user = MagicMock(id=999, first_name="Stranger", username="someone")
 
     with patch.object(adapter, "_is_callback_user_authorized", return_value=False):
@@ -3102,8 +3232,8 @@ async def test_a_second_tap_on_the_same_card_is_told_it_is_already_handled(parti
 
     with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
         await adapter._handle_callback_query(
-            MagicMock(callback_query=_owner_tap(adapter, data=f"gp:a:{rid}")), MagicMock())
-        second = _owner_tap(adapter, data=f"gp:a:{rid}")
+            MagicMock(callback_query=_owner_tap(adapter, data=f"gp:o:{rid}")), MagicMock())
+        second = _owner_tap(adapter, data=f"gp:o:{rid}")
         await adapter._handle_callback_query(MagicMock(callback_query=second), MagicMock())
 
     assert "expired" in second.answer.await_args.kwargs["text"].lower() or \
@@ -3154,3 +3284,121 @@ async def test_a_tap_on_the_approval_card_itself_never_raises_a_request(particip
 
     assert query.answer.await_args.kwargs["text"] == "nope"
     adapter._bot.send_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The production bug: taps on the in-chat card answered "prompt expired"
+#
+# The card is an inline message, so the tap carries no chat. The dispatcher refused it
+# because _guest_inline_chats held no entry for the inline_message_id Telegram handed
+# back — three taps by the allowlisted operator, three refusals, nothing approved.
+# A participation tap needs no such entry: the callback data names the request, and the
+# request names the chat it belongs to.
+# ---------------------------------------------------------------------------
+
+async def _mention_with_card_imi(adapter, imi, **kwargs):
+    """Raise a request whose in-chat card came back with *imi* (a real object, not a mock).
+
+    This module replaces the whole ``telegram`` package with a MagicMock, so
+    ``SentGuestMessage`` here would auto-create any attribute asked of it — including an
+    ``inline_message_id`` that silently matches whatever a test compares it to.
+    """
+    adapter._bot.answer_guest_query = AsyncMock(
+        return_value=SimpleNamespace(inline_message_id=imi))
+    await _unauthorized_mention(adapter, **kwargs)
+    return _request_id(adapter)
+
+
+@pytest.mark.asyncio
+async def test_a_tap_whose_inline_message_is_unknown_still_resolves_the_request(participation_home):
+    """The reported failure, from the other side: the id on the tap need not be one we recorded."""
+    adapter = _participation_adapter()
+    rid = await _mention_with_card_imi(adapter, "imi_A")
+    assert adapter._guest_participation_requests[rid]["inline_message_id"] == "imi_A"
+    query = _tap(adapter, data=f"gp:o:{rid}", imi="imi_B")
+    query.from_user = MagicMock(id=1, first_name="Owner", username="owner")
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=True), \
+         patch.object(adapter, "_should_process_message", return_value=True), \
+         patch.object(adapter, "_enqueue_text_event") as enqueue:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    assert adapter._guest_participation_requests == {}
+    enqueue.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_inline_message_does_not_weaken_the_gate(participation_home):
+    """Routing the tap is not authorizing it: the chat it is judged against is the request's."""
+    from gateway.pairing import PairingStore
+
+    adapter = _participation_adapter(allow_always=True)
+    rid = await _mention_with_card_imi(adapter, "imi_A")
+    query = _tap(adapter, data=f"gp:a:{rid}", imi="imi_B")
+
+    with patch.object(adapter, "_is_callback_user_authorized", return_value=False) as gate:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    assert PairingStore().is_approved("telegram", "999") is False
+    assert _request_id(adapter) == rid  # left for whoever may decide it
+    # Judged against the chat the REQUEST names, not a chat-less DM-shaped source.
+    assert gate.call_args.kwargs["chat_id"] == "42"
+    assert gate.call_args.kwargs["chat_type"] == "supergroup"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_request_id_on_an_unattributable_tap_just_expires(participation_home):
+    """No record, no chat to authorize against — and nothing to do but say so."""
+    adapter = _participation_adapter()
+    query = _tap(adapter, data="gp:o:deadbeef", imi="imi_unknown")
+
+    with patch.object(adapter, "_is_callback_user_authorized") as gate:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    gate.assert_not_called()
+    assert "expired" in query.answer.await_args.kwargs["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_other_prefixes_on_an_unattributable_tap_are_still_refused():
+    """Only participation taps carry their own context; every other one is refused as before."""
+    adapter = _participation_adapter()
+    query = _tap(adapter, data="cl:q0:0", imi="imi_unknown")
+
+    with patch.object(adapter, "_is_callback_user_authorized") as gate:
+        await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+    gate.assert_not_called()
+    # The dispatcher's own refusal, verbatim — not the participation handler's "expired", which a
+    # bogus request id would also produce if every prefix were routed there.
+    assert query.answer.await_args.kwargs["text"] == "⚠️ This prompt expired — please ask again."
+    adapter._bot.send_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The operator copy is optional
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_the_operator_copy_can_be_turned_off():
+    """The home channel is used for other things; silencing it must not mean unsetting it."""
+    adapter = _participation_adapter({"guest_participation_operator_copy": False})
+
+    await _unauthorized_mention(adapter)
+
+    adapter._bot.send_message.assert_not_awaited()
+    # The in-chat card is then the only surface — and it still carries the buttons.
+    result = adapter._bot.answer_guest_query.await_args.args[1]
+    assert _keyboard_buttons(result.reply_markup)
+    assert len(adapter._guest_participation_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_with_the_copy_off_and_no_in_chat_card_the_request_is_dropped():
+    """The "no surface, no request" rule still holds when the copy is the thing turned off."""
+    adapter = _participation_adapter({"guest_participation_operator_copy": False})
+    adapter._bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("query expired"))
+
+    await _unauthorized_mention(adapter)
+
+    assert adapter._guest_participation_requests == {}

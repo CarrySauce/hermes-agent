@@ -1362,7 +1362,9 @@ platform_toolsets:
 #       guest_progress_card: true     # guest_mode: fold tool progress + iteration/elapsed into the one message on screen
 #       guest_progress_interval_seconds: 10  # guest_progress_card: minimum seconds between two edits of that message
 #       guest_participation: false    # guest_mode: an unknown caller becomes an Allow/Deny card in your own chat instead of a silent deny
-#       guest_approval_chat: ""       # guest_participation: chat your copy of the Allow/Deny card goes to (the asking chat always gets one); default: home channel
+#       guest_participation_allow_always: false  # guest_participation: also offer permanent access (hermes pairing approve, every chat) on the card
+#       guest_participation_operator_copy: true  # guest_participation: also post your own copy of the card; false leaves the in-chat card as the only surface
+#       guest_approval_chat: ""       # guest_participation: chat your copy of the card goes to (the asking chat always gets one); default: home channel
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames
 #       allow_cjk_rich_messages: false # Keep CJK content on the safe MarkdownV2 path unless an unaffected client explicitly opts in to native rich rendering
