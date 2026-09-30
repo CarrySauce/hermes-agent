@@ -1188,9 +1188,13 @@ A tap on a button they aren't allowed to use raises the same card, naming the ac
 
 - **Allow once** runs that one request **on that same message** — the card becomes the progress
   card and then the reply, exactly where they asked — and grants nothing at all: no pairing-store
-  entry, no `.env` write, and their next message is gated again into a fresh card. If there is
+  entry, no `.env` write, and their next message is gated again into a fresh card. Internally that
+  one request carries a single-event authorization so the gateway admits it without a grant; it is
+  never stored, never serialized, and never present on anything else they send. If there is
   nothing left to run (a gateway restart dropped the pending request, or it came from a button tap,
-  which cannot be replayed) the card says so and still grants nothing.
+  which cannot be replayed) the card says so and still grants nothing. And if the request is
+  approved but never picked up, both cards say so within half a minute rather than sitting there
+  looking busy.
 - **Deny** tells them no and silences that person in that chat for a day, so a card cannot be made
   to reappear by asking repeatedly.
 - **Allow always** is the durable grant and appears only with

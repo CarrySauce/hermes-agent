@@ -82,6 +82,12 @@ class SessionSource:
     parent_chat_id: Optional[str] = None  # parent channel when chat_id is a thread
     message_id: Optional[str] = None  # triggering message (pin/reply/react)
     role_authorized: bool = False  # adapter granted access via role, not user ID
+    # One event an operator approved by hand, on its own card (Telegram guest participation's
+    # "Allow once"). NOT a grant and deliberately absent from ``_ALWAYS_FIELDS`` and the
+    # ``_OPTIONAL_*`` tuples, so ``to_dict``/``from_dict`` cannot carry it: no persisted session
+    # origin, relay payload or plugin injection can set it, and the sender's next message — a fresh
+    # source — is authorized again from scratch.
+    participation_authorized: bool = field(default=False, repr=False, compare=False)
     # Multiplex profile this message routes to (None => active/default); namespaces the key.
     profile: Optional[str] = None
     # Transport-local fail-closed signal: explicit profile route whose target is not served.

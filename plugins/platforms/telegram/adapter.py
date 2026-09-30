@@ -3628,6 +3628,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # thread through in the very metadata this branch already reads for
                 # expect_edits/notify, so a chat running two turns keeps them apart.
                 _tk = self._guest_turn_key(chat_id=_cid_str, metadata=metadata)
+                self._note_guest_turn_activity(_tk)
                 if _tk is None:
                     # Several turns live and nothing says which: writing to either one's surface
                     # would put this turn's text on another conversation's message.
@@ -3860,6 +3861,7 @@ class TelegramAdapter(BasePlatformAdapter):
             inline_message_id=message_id, chat_id=chat_id, metadata=metadata)
         _imi = self._guest_inline_message_ids.get(_edit_tk) if _edit_tk else None
         if isinstance(_imi, str) and message_id == _imi:
+            self._note_guest_turn_activity(_edit_tk)
             self._close_guest_progress_card(_edit_tk)
             _text = content
             for _cur in (" ▉", "▉"):
@@ -5658,6 +5660,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # while one slow tool runs and no progress line arrives. The card's own throttle decides
         # whether a tick becomes an edit.
         if _typing_tk is not None and self._is_guest_chat(_cid_str):
+            self._note_guest_turn_activity(_typing_tk)
             await self._draw_guest_progress_card(_typing_tk)
 
         _is_dm_topic: bool = False
@@ -5859,6 +5862,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
         ("_guest_progress_cards", dict),
         ("_guest_participation_requests", dict), ("_guest_participation_declined", dict),
+        ("_guest_turn_activity", dict),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -5998,7 +6002,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for store in (
             self._pending_guest_queries, self._guest_inline_message_ids, self._guest_reply_buffer,
             self._guest_turn_media, self._guest_turn_media_all, self._guest_answered_lines,
-            self._guest_media_group_ids, self._guest_progress_cards,
+            self._guest_media_group_ids, self._guest_progress_cards, self._guest_turn_activity,
         ):
             store.pop(key, None)
         self._guest_prompt_undeliverable.discard(key)
@@ -8120,24 +8124,93 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] guest operator card edit failed: %s",
                 self.name, _redact_telegram_error_text(exc))
 
-    async def _replay_guest_request(self, record: Dict[str, Any]) -> bool:
+    async def _replay_guest_request(self, record: Dict[str, Any], *, always: bool) -> bool:
         """Run the request that raised this card, on the card itself. False when it could not run.
 
         The query it arrived with was spent drawing that card, so the message the card lives on is
-        adopted as the turn's surface — exactly what every other guest write targets anyway. The
-        caller is authorized by now, so this is the call the gate would have made at the time.
+        adopted as the turn's surface — exactly what every other guest write targets anyway.
+
+        How the replayed event is authorized depends on which button was tapped. ``always`` already
+        wrote a pairing grant, which the gateway's own chain honours, so the event needs nothing.
+        "Allow once" wrote nothing on purpose, so it carries the one-shot ``participation_authorized``
+        stamp instead — otherwise the runner refuses the event it just built.
         """
         replay = record.get("replay") or {}
         msg, update = replay.get("msg"), replay.get("update")
         inline_message_id = record.get("inline_message_id")
         if msg is None or update is None or not inline_message_id:
             return False
-        return await self._start_guest_turn(
+        started = await self._start_guest_turn(
             msg, update, guest_query_id=str(replay.get("guest_query_id") or ""),
             chat_id_str=str(record["chat_id"]), caller_id=str(record["user_id"]),
             chat_type=record["chat_type"], has_media=bool(replay.get("has_media")),
             media_group_id=str(replay.get("media_group_id") or ""),
-            inline_message_id=str(inline_message_id))
+            inline_message_id=str(inline_message_id), participation_authorized=not always)
+        if started:
+            self._watch_guest_replay(
+                self._guest_turn_key(inline_message_id=str(inline_message_id),
+                                     chat_id=str(record["chat_id"])) or str(record["chat_id"]),
+                record)
+        return started
+
+    _GUEST_REPLAY_WATCHDOG_SECONDS = 25.0
+
+    def _note_guest_turn_activity(self, turn_key: Any) -> None:
+        """Record that the gateway is actually driving this turn.
+
+        Stamped by the three outbound paths a live turn always hits — typing, a send, an edit — so
+        "the gateway never picked this up" is a fact rather than a guess about timing.
+        """
+        if turn_key is None:
+            return
+        self._ensure_guest_state()
+        self._guest_turn_activity[str(turn_key)] = time.monotonic()
+
+    def _watch_guest_replay(self, turn_key: str, record: Dict[str, Any]) -> None:
+        """Fail an approved request that the gateway never picked up, loudly and on its own card.
+
+        ``_start_guest_turn`` returning True means the event was handed over, not that it was
+        admitted: the inbound path authorizes it again and drops what it refuses without telling
+        this adapter. That left the operator told "it is running", the caller looking at the card
+        they tapped, and the turn registered for good — three of those and the chat sits at its
+        concurrency ceiling with nothing running. So wait, and if nothing has driven the turn by
+        then, release it and correct BOTH cards — the operator was told it was running.
+        Fire-and-forget: it must never delay the tap that started it.
+        """
+        key = str(turn_key)
+        inline_message_id = str(record.get("inline_message_id") or "")
+
+        async def _watch() -> None:
+            try:
+                await asyncio.sleep(self._GUEST_REPLAY_WATCHDOG_SECONDS)
+                if not self._guest_turn_is_live(key) or self._guest_turn_activity.get(key):
+                    return
+                logger.error(
+                    "[%s] Approved guest request was never picked up by the gateway "
+                    "(turn=%s chat=%s); releasing it. Check for an 'Unauthorized user' line.",
+                    self.name, key, self._guest_chat_for_turn(key))
+                self._release_guest_turn(key)
+                if self._bot and inline_message_id:
+                    await self._bot.edit_message_text(
+                        text="⚠️ Something went wrong on my side and your request never ran. "
+                             "Please @mention me again.",
+                        inline_message_id=inline_message_id)
+                await self._close_guest_operator_card(
+                    record, "⚠️ That request never ran — the gateway did not pick it up. "
+                            "Nothing was granted; they can ask again.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[%s] guest replay watchdog failed (turn=%s): %s",
+                    self.name, key, _redact_telegram_error_text(exc))
+
+        try:
+            task = asyncio.get_running_loop().create_task(_watch())
+        except RuntimeError:
+            return  # No loop (a sync caller in tests): nothing scheduled this replay either.
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _handle_guest_participation_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``gp:<o|a|d>:<request_id>`` — allow this one request, allow always, or deny.
@@ -8224,7 +8297,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # durable grant first, and a replay on a failed write would answer someone who is still
         # blocked — so it never runs.
         granted = await self._grant_guest_participation(record["user_id"], record["user_name"]) if always else True
-        replayed = await self._replay_guest_request(record) if granted else False
+        replayed = await self._replay_guest_request(record, always=always) if granted else False
         if not granted:
             await query.answer(text="⚠️ Could not save that grant")
             await self._resolve_guest_participation_cards(
@@ -8758,7 +8831,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _start_guest_turn(
         self, msg: Any, update: Any, *, guest_query_id: str, chat_id_str: str, caller_id: str,
         chat_type: Any, has_media: bool, media_group_id: str = "",
-        inline_message_id: Optional[str] = None,
+        inline_message_id: Optional[str] = None, participation_authorized: bool = False,
     ) -> bool:
         """Open a guest turn for this mention and route it to the agent. False when refused.
 
@@ -8769,6 +8842,11 @@ class TelegramAdapter(BasePlatformAdapter):
         ``inline_message_id`` adopts a message this adapter already owns as the turn's surface.
         That is the approval path's only way back: it spent the one-shot query telling the caller
         to wait, and a guest chat has no other message the bot may write to.
+
+        ``participation_authorized`` stamps the ONE event this builds as approved by hand. The
+        gateway authorizes inbound events again on arrival and drops what it refuses, so without it
+        an "Allow once" replay is admitted by this adapter and then binned by the runner: the
+        operator is told it is running and nothing ever answers. Only the replay path passes it.
         """
         # Concurrency ceiling, checked before a thread is resolved so a refusal mints nothing:
         # a group chat must not be able to fan out unbounded agent turns.
@@ -8832,6 +8910,10 @@ class TelegramAdapter(BasePlatformAdapter):
             update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         self._apply_guest_thread(event, _thread_token)
+        if participation_authorized:
+            # On this event only, and on nothing the caller sends next: their following messages
+            # build their own source and meet the same refusal as before.
+            event.source = dataclasses.replace(event.source, participation_authorized=True)
 
         # Session isolation per guest caller falls out of _build_message_event for
         # free now: it reads user_id/user_name straight off msg.from_user, which is

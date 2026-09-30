@@ -583,6 +583,14 @@ class GatewayAuthorizationMixin:
         # Adapter-verified role auth (Discord DISCORD_ALLOWED_ROLES). ``is True``: no MagicMock pass.
         if allow_adapter_delegation and getattr(source, "role_authorized", False) is True:
             return True
+        # One event an operator approved by hand on its own card (Telegram guest participation's
+        # "Allow once"): the adapter refused this sender, showed the operator what they asked for,
+        # and is replaying exactly that request because the operator said to. Checked here because
+        # the inbound path authorizes the replayed event AGAIN and silently drops what it refuses.
+        # Not a grant: the flag rides one event, is never serialized (``SessionSource.to_dict``
+        # omits it), and the sender's next message is refused again. ``is True``: no MagicMock pass.
+        if allow_adapter_delegation and getattr(source, "participation_authorized", False) is True:
+            return True
         # Pairing store: a first-class grant created only by an operator approving a code. Honored as
         # a UNION with the allowlist (approval also mirrors into it).
         pairing_store = self._pairing_store_for(source)
