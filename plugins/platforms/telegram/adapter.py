@@ -4779,7 +4779,8 @@ class TelegramAdapter(BasePlatformAdapter):
         inline_message_id = getattr(query, "inline_message_id", None)
         return (self._guest_prompt_texts.get(str(inline_message_id)) or "") if inline_message_id else ""
 
-    async def _callback_authorized(self, query, cb: Dict[str, Any], denial_text: str) -> bool:
+    async def _callback_authorized(
+        self, query, cb: Dict[str, Any], denial_text: str, *, participation: bool = True) -> bool:
         """Gate a button tap on the callback allowlist; answers ``denial_text`` when refused.
 
         With guest participation on, a refusal in a GUEST chat additionally asks the operator to let
@@ -4793,7 +4794,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_type=str(cb["chat_type"]) if cb["chat_type"] is not None else None,
             thread_id=str(cb["thread_id"]) if cb["thread_id"] is not None else None, user_name=cb["user_name"]):
             return True
-        if cb.get("chat_id") is not None and self._is_guest_chat(cb["chat_id"]) and await self._request_guest_participation(
+        if participation and cb.get("chat_id") is not None and self._is_guest_chat(cb["chat_id"]) and await self._request_guest_participation(
             chat_id=cb["chat_id"], chat_type=cb.get("chat_type"),
             user_id=getattr(query.from_user, "id", None), user_name=cb.get("user_name"),
             what=self._guest_tap_what(query),
@@ -7752,18 +7753,25 @@ class TelegramAdapter(BasePlatformAdapter):
     # request — the person is told someone has to let them in, and the operator gets a card in their
     # OWN chat naming who asked, from which chat, and what they were doing, with Allow / Deny on it.
     #
-    # Two things make that safe. The card is only ever posted to the operator's own chat (the home
-    # channel by construction, which a guest chat can never be — the bot is not a member of one), so
-    # the person asking cannot tap their own approval. And Allow is the grant the gateway already
-    # has: a pairing-store approval, the same one ``hermes pairing approve`` writes, honored as a
-    # union with the env allowlists and mirrored into TELEGRAM_ALLOWED_USERS when one is configured.
-    # Nothing here authorizes a turn: raising a request denies the caller exactly as before, and the
-    # next thing they send runs through the same gate.
+    # The card goes to BOTH ends, because the operator may be in either: onto the message in the
+    # chat that asked (``reply_markup`` on an inline message needs no chat membership, which is how
+    # every guest control prompt already works), so an operator who is in that group decides in
+    # place; and into the operator's own chat, so one who is not still hears about it. Either alone
+    # is enough. What makes the in-chat buttons safe is that a tap is authorized on WHO pressed it,
+    # never on where the button sits: a stranger pressing their own Allow is refused by the very
+    # gate that refused their message. The operator's copy is still never posted into the chat that
+    # asked — that would tell the asker a chat id they were not given.
     #
-    # The request is deliberately NOT replayed on approval. A guest query is one-shot and
-    # short-lived: the slot is spent telling the person to wait, so by the time the operator taps
-    # there is nothing left to answer with. The message they are looking at is edited to say they
-    # can ask again instead.
+    # Allow is the grant the gateway already has: a pairing-store approval, the same one
+    # ``hermes pairing approve`` writes, honored as a union with the env allowlists and mirrored
+    # into TELEGRAM_ALLOWED_USERS when one is configured. Nothing here authorizes a turn on its
+    # own: raising a request denies the caller exactly as before.
+    #
+    # On Allow the request is then run, on the card itself. The query it arrived with was spent
+    # telling the caller to wait, so the message that answer produced is adopted as the turn's
+    # surface and the reply, its progress and any question land there — the same message the
+    # operator just tapped. When the turn cannot start (that conversation is busy, gating refused
+    # it) the card says so instead, and the caller can simply ask again.
 
     _GUEST_PARTICIPATION_TTL_SECONDS = 30 * 60
     _GUEST_PARTICIPATION_MAX_PENDING = 8
@@ -7819,6 +7827,17 @@ class TelegramAdapter(BasePlatformAdapter):
         prompt = self._guest_participation_summary(self._callback_prompt_text(query))
         return f"{action} on “{prompt}”" if prompt else action
 
+    def _guest_participation_keyboard(self, request_id: str) -> Any:
+        """Allow/Deny for one request; the same buttons go on both cards.
+
+        Safe in the chat that asked because a tap is gated on who pressed it: the stranger who
+        raised the request is refused by the same gate that refused their message.
+        """
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Allow", callback_data=f"gp:a:{request_id}"),
+            InlineKeyboardButton("🚫 Deny", callback_data=f"gp:d:{request_id}"),
+        ]])
+
     def _guest_participation_slot(self, chat_id: Any, user_id: Any) -> str:
         """Identity of a would-be participant: one open request per person per chat."""
         return f"{chat_id}:{user_id}"
@@ -7843,31 +7862,23 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _request_guest_participation(
         self, *, chat_id: Any, chat_type: Any, user_id: Any, user_name: Any, what: str,
         chat_title: Any = None, guest_query_id: Optional[str] = None,
+        replay: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Ask the operator to let this person in. True when a request is now pending for them.
 
-        False leaves the caller's own denial path in charge — the feature is off, there is no
-        operator chat to ask in, the person was already declined, too many requests are open, or the
-        card could not be delivered. Either way the caller is denied: approval is a separate tap.
+        False leaves the caller's own denial path in charge — the feature is off, the person was
+        already declined, too many requests are open, or neither card could be delivered. Either
+        way the caller is denied: approval is a separate tap.
+
+        ``replay`` carries what it takes to run the request once approved (the message, its update,
+        and the query it arrived with). Without it an approval only grants access and the caller
+        asks again.
         """
         if not (self._telegram_guest_mode() and self._telegram_guest_participation()):
             return False
         self._ensure_guest_state()
         _uid, _cid = str(user_id or "").strip(), str(chat_id or "").strip()
         if not _uid or not _cid or not self._bot:
-            return False
-        approval_chat = str(self._guest_approval_chat_id() or "").strip()
-        if not approval_chat:
-            logger.warning(
-                "[%s] Guest participation is on but there is no operator chat to ask in "
-                "(set TELEGRAM_HOME_CHANNEL or extra.guest_approval_chat); denying as before", self.name)
-            return False
-        if approval_chat == _cid:
-            # The card carries the button that grants access, so posting it where the person asking
-            # can reach it would let them approve themselves.
-            logger.warning(
-                "[%s] Refusing to post a guest approval card into the chat that asked (chat=%s)",
-                self.name, _cid)
             return False
         self._prune_guest_participation()
         slot = self._guest_participation_slot(_cid, _uid)
@@ -7896,19 +7907,40 @@ class TelegramAdapter(BasePlatformAdapter):
             "chat_title": str(chat_title or "").strip(), "user_id": _uid,
             "user_name": str(user_name or "").strip(), "what": what,
             "created": time.time(), "inline_message_id": None,
+            "operator_chat": None, "operator_message_id": None, "replay": replay or None,
         }
-        # Stored before the card goes out: its buttons carry this id, and a tap can land before the
-        # send() call returns.
+        # Stored before either card goes out: their buttons carry this id, and a tap can land
+        # before the call that drew them returns.
         self._guest_participation_requests[request_id] = record
-        if not await self._post_guest_approval_card(approval_chat, request_id, record):
+        # Both ends, in this order: the chat that asked is where the person is looking and where an
+        # operator who is in that group can decide in place.
+        await self._answer_guest_participation_wait(guest_query_id, request_id)
+        await self._post_guest_approval_card(request_id, record)
+        if not (record["inline_message_id"] or record["operator_message_id"]):
+            # Nothing on any screen carries these buttons, so nobody can resolve the request —
+            # leaving it pending would only refuse this person's later asks for half an hour.
             self._guest_participation_requests.pop(request_id, None)
             return False
-        await self._answer_guest_participation_wait(guest_query_id, request_id)
         return True
 
-    async def _post_guest_approval_card(
-        self, approval_chat: str, request_id: str, record: Dict[str, Any]) -> bool:
-        """Put the Allow/Deny card in the operator's chat; False when it could not be delivered."""
+    async def _post_guest_approval_card(self, request_id: str, record: Dict[str, Any]) -> bool:
+        """Put the operator's copy of the card in their own chat; False when it did not go out.
+
+        Never into the chat that asked — that copy names the chat and would hand the asker a chat
+        id they were not given. The in-chat copy (``_answer_guest_participation_wait``) is the one
+        that lives there, and it carries the same buttons.
+        """
+        approval_chat = str(self._guest_approval_chat_id() or "").strip()
+        if not approval_chat:
+            logger.info(
+                "[%s] No operator chat for the guest approval card (set TELEGRAM_HOME_CHANNEL or "
+                "extra.guest_approval_chat); the in-chat card carries the buttons", self.name)
+            return False
+        if approval_chat == str(record["chat_id"]):
+            logger.warning(
+                "[%s] Refusing to post the operator's approval card into the chat that asked (chat=%s)",
+                self.name, record["chat_id"])
+            return False
         who = record["user_name"] or f"user {record['user_id']}"
         where = record["chat_title"] or record["chat_id"]
         text = (
@@ -7918,30 +7950,31 @@ class TelegramAdapter(BasePlatformAdapter):
             "<b>Allow</b> gives them the same access as <code>hermes pairing approve</code> — "
             "every chat this bot serves, until you revoke it."
         )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Allow", callback_data=f"gp:a:{request_id}"),
-            InlineKeyboardButton("🚫 Deny", callback_data=f"gp:d:{request_id}"),
-        ]])
         try:
-            await self._bot.send_message(
+            sent = await self._bot.send_message(
                 chat_id=normalize_telegram_chat_id(approval_chat), text=text,
-                parse_mode=ParseMode.HTML, reply_markup=keyboard)
-            logger.info(
-                "[%s] Guest participation requested (chat=%s user=%s request=%s)",
-                self.name, record["chat_id"], record["user_id"], request_id)
-            return True
+                parse_mode=ParseMode.HTML, reply_markup=self._guest_participation_keyboard(request_id))
         except Exception as exc:
             logger.warning(
                 "[%s] Guest approval card could not be delivered to %s: %s",
                 self.name, approval_chat, _redact_telegram_error_text(exc))
             return False
+        # Kept so resolving from one card can clear the other's buttons.
+        record["operator_chat"] = approval_chat
+        record["operator_message_id"] = str(getattr(sent, "message_id", "") or "") or None
+        logger.info(
+            "[%s] Guest participation requested (chat=%s user=%s request=%s)",
+            self.name, record["chat_id"], record["user_id"], request_id)
+        return True
 
     async def _answer_guest_participation_wait(
         self, guest_query_id: Optional[str], request_id: str) -> None:
-        """Tell the person their request is with the operator, keeping the message to update later.
+        """Draw the request on the message in the chat that asked, buttons and all.
 
-        Best effort: without it they see the old dead end, but the request is pending either way, so
-        a failure here must not undo it. A button tap has no query to answer — the toast says it.
+        This is the copy the person sees AND the one an operator who is in that group taps, so the
+        one-shot query is worth spending on it. It is also the surface the approved request is then
+        answered on, which is why the inline message id is kept. Best effort: a button tap has no
+        query to answer at all, and the operator's own copy still carries the same buttons.
         """
         record = self._guest_participation_requests.get(request_id)
         if not guest_query_id or record is None or not self._bot:
@@ -7951,8 +7984,9 @@ class TelegramAdapter(BasePlatformAdapter):
             InlineQueryResultArticle(
                 id="participation", title="Waiting for approval",
                 input_message_content=InputTextMessageContent(
-                    "🙋 I don't know you yet — I've asked my owner to let you in. "
-                    "This message will change once they decide."),
+                    "🙋 I don't know you yet — my owner has to let me answer here. I've asked "
+                    "them, and they can also decide right here. Only they can use these buttons."),
+                reply_markup=self._guest_participation_keyboard(request_id),
             ),
             log_label="participation request reply")
         inline_message_id = getattr(sent, "inline_message_id", None) if ok else None
@@ -8003,7 +8037,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _close_guest_participation_card(
         self, record: Dict[str, Any], *, granted: bool) -> None:
-        """Update the message the person is looking at with the operator's decision."""
+        """Land the decision on the message in the chat that asked, buttons removed.
+
+        Only for the outcomes the turn does not take over: a grant whose request could not be run,
+        and every denial. ``editMessageText`` with no ``reply_markup`` drops the keyboard, so the
+        Allow button cannot be tapped again.
+        """
         inline_message_id = record.get("inline_message_id")
         if not inline_message_id or not self._bot:
             return
@@ -8018,45 +8057,106 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] guest participation card edit failed: %s",
                 self.name, _redact_telegram_error_text(exc))
 
+    async def _close_guest_operator_card(self, record: Dict[str, Any], text: str) -> None:
+        """Land the decision on the operator's own copy, so no live Allow button is left behind."""
+        chat_id, message_id = record.get("operator_chat"), record.get("operator_message_id")
+        if not chat_id or not message_id or not self._bot:
+            return
+        try:
+            await self._bot.edit_message_text(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), text=text)
+        except Exception as exc:
+            logger.debug(
+                "[%s] guest operator card edit failed: %s",
+                self.name, _redact_telegram_error_text(exc))
+
+    async def _replay_guest_request(self, record: Dict[str, Any]) -> bool:
+        """Run the request that raised this card, on the card itself. False when it could not run.
+
+        The query it arrived with was spent drawing that card, so the message the card lives on is
+        adopted as the turn's surface — exactly what every other guest write targets anyway. The
+        caller is authorized by now, so this is the call the gate would have made at the time.
+        """
+        replay = record.get("replay") or {}
+        msg, update = replay.get("msg"), replay.get("update")
+        inline_message_id = record.get("inline_message_id")
+        if msg is None or update is None or not inline_message_id:
+            return False
+        return await self._start_guest_turn(
+            msg, update, guest_query_id=str(replay.get("guest_query_id") or ""),
+            chat_id_str=str(record["chat_id"]), caller_id=str(record["user_id"]),
+            chat_type=record["chat_type"], has_media=bool(replay.get("has_media")),
+            media_group_id=str(replay.get("media_group_id") or ""),
+            inline_message_id=str(inline_message_id))
+
     async def _handle_guest_participation_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``gp:<a|d>:<request_id>`` — the operator letting a guest caller in, or not.
 
-        Gated on the ordinary callback allowlist, which cannot raise a participation request of its
-        own here: these buttons live in the operator's chat, never a guest one, and a request raised
-        from a tap on them would be asking whether to approve the approver.
+        Gated on the ordinary callback allowlist with the participation fallback switched OFF: the
+        stranger who raised this request can see these buttons (one copy sits in their own chat), so
+        their tap must be the flat refusal and must not rewrite the very request it is asking about.
         """
         parts = data.split(":", 2)
         if len(parts) != 3:
             return
         choice, request_id = parts[1], parts[2]
-        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED, participation=False):
             return
         self._prune_guest_participation()
-        # Popped, so two operators tapping the same card resolve it once.
+        # Popped, so the two copies of this card resolve it once between them.
         record = self._guest_participation_requests.pop(request_id, None)
         if record is None:
             await query.answer(text="Already handled, or the request expired.")
             await self._edit_md_quiet(query, "⌛ This request expired or was already handled.")
             return
+        # Which copy was tapped: the one in the chat that asked is also the surface an approved
+        # request is answered on, so the turn — not this handler — writes it.
+        tapped = str(getattr(query, "inline_message_id", None) or "")
+        on_guest_card = bool(tapped) and tapped == str(record.get("inline_message_id") or "")
         who = record["user_name"] or f"user {record['user_id']}"
         operator = getattr(query.from_user, "first_name", "an operator")
         if choice == "a":
             granted = await self._grant_guest_participation(record["user_id"], record["user_name"])
+            # Run what they asked for, right here on the card. Only once the grant is real: a
+            # replay on a failed grant would answer someone the operator has not actually let in.
+            replayed = await self._replay_guest_request(record) if granted else False
             label = f"✅ Allowed {who}" if granted else "⚠️ Could not save that grant"
             detail = (
                 f"✅ {who} was allowed by {operator}."
+                + (" Their request is running." if replayed else " They can ask again.")
                 if granted else
                 f"⚠️ {who} could NOT be allowed — saving the grant failed, so they are still "
                 "blocked. See the gateway log, then try again or run `hermes pairing approve`.")
             await query.answer(text=label)
-            await self._edit_md_quiet(query, detail)
-            await self._close_guest_participation_card(record, granted=granted)
+            await self._resolve_guest_participation_cards(
+                query, record, detail, on_guest_card=on_guest_card,
+                # Replayed: the turn owns that message from here on, and writing "allowed" over it
+                # would race its first edit.
+                close_guest_card=None if replayed else granted)
             return
         # Denied: stamp the person so they cannot make this card reappear for a day.
         self._guest_participation_declined[record["slot"]] = time.time()
         await query.answer(text=f"🚫 Denied {who}")
-        await self._edit_md_quiet(query, f"🚫 {who} was denied by {operator}.")
-        await self._close_guest_participation_card(record, granted=False)
+        await self._resolve_guest_participation_cards(
+            query, record, f"🚫 {who} was denied by {operator}.",
+            on_guest_card=on_guest_card, close_guest_card=False)
+
+    async def _resolve_guest_participation_cards(
+        self, query, record: Dict[str, Any], detail: str, *, on_guest_card: bool,
+        close_guest_card: Optional[bool],
+    ) -> None:
+        """Leave no live Allow button behind, on either copy of a resolved request.
+
+        ``close_guest_card`` is the decision to show in the chat that asked, or None when the turn
+        has taken that message over. The tapped copy is updated through ``query``; the other one by
+        its recorded id.
+        """
+        if not on_guest_card:
+            await self._edit_md_quiet(query, detail)
+        if close_guest_card is not None:
+            await self._close_guest_participation_card(record, granted=close_guest_card)
+        if on_guest_card:
+            await self._close_guest_operator_card(record, detail)
 
     # Answered questions kept above the pending one. Three keeps the card readable and well
     # inside Telegram's 4,096-character limit even with long questions.
@@ -8462,7 +8562,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 user_name=(getattr(msg.from_user, "username", None)
                            or getattr(msg.from_user, "first_name", None)),
                 what=self._guest_mention_what(text), chat_title=getattr(msg.chat, "title", None),
-                guest_query_id=guest_query_id)
+                guest_query_id=guest_query_id,
+                # Everything needed to run this exact request if the operator allows it, so the
+                # answer lands on the card they tapped instead of asking them to repeat themselves.
+                replay={
+                    "msg": msg, "update": update, "guest_query_id": guest_query_id,
+                    "has_media": has_media,
+                    "media_group_id": str(getattr(msg, "media_group_id", "") or ""),
+                })
             return
 
         # Attachment redemption: the caller tapped the button on an earlier reply, which
@@ -8526,20 +8633,43 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._enqueue_text_event(self._apply_telegram_group_observe_attribution(_continuation))
                 return
 
+        # Concurrency ceiling, the thread, the busy guard and the turn itself — shared with the
+        # approval path, which runs exactly this once an operator lets the caller in.
+        await self._start_guest_turn(
+            msg, update, guest_query_id=guest_query_id, chat_id_str=chat_id_str,
+            caller_id=_guest_caller_id, chat_type=_guest_chat_type, has_media=has_media,
+            media_group_id=_media_group_id)
+
+    async def _start_guest_turn(
+        self, msg: Any, update: Any, *, guest_query_id: str, chat_id_str: str, caller_id: str,
+        chat_type: Any, has_media: bool, media_group_id: str = "",
+        inline_message_id: Optional[str] = None,
+    ) -> bool:
+        """Open a guest turn for this mention and route it to the agent. False when refused.
+
+        Refused means the conversation is already working, the chat is at its concurrency
+        ceiling, message gating rejected it, or it was a slash command — all of which the caller
+        has to report, because the surface is the only place anything can be said.
+
+        ``inline_message_id`` adopts a message this adapter already owns as the turn's surface.
+        That is the approval path's only way back: it spent the one-shot query telling the caller
+        to wait, and a guest chat has no other message the bot may write to.
+        """
         # Concurrency ceiling, checked before a thread is resolved so a refusal mints nothing:
         # a group chat must not be able to fan out unbounded agent turns.
         _live_turns = self._guest_live_turn_keys(chat_id_str)
         if len(_live_turns) >= self._GUEST_MAX_CONCURRENT_TURNS:
             logger.info(
                 "[%s] Guest turn refused, chat at its concurrency ceiling (chat=%s caller=%s live=%s)",
-                self.name, chat_id_str, _guest_caller_id, _live_turns)
-            await self._guest_busy_reply(guest_query_id)
-            return
+                self.name, chat_id_str, caller_id, _live_turns)
+            if inline_message_id is None:
+                await self._guest_busy_reply(guest_query_id)
+            return False
 
         # Which conversation this mention belongs to: a reply to one of the bot's messages
         # continues that thread, anything else starts a fresh one. Resolved BEFORE the busy guard
         # so the guard can be about the thread rather than the chat.
-        _thread_token = await self._resolve_guest_thread(chat_id_str, msg, _guest_caller_id)
+        _thread_token = await self._resolve_guest_thread(chat_id_str, msg, caller_id)
         _turn_key = _thread_token or chat_id_str
 
         # One surface per turn, so two turns in ONE conversation would still fight over it: the
@@ -8550,29 +8680,37 @@ class TelegramAdapter(BasePlatformAdapter):
         if _turn_key in self._pending_guest_queries:
             logger.info(
                 "[%s] Guest turn refused, its conversation is still working (chat=%s caller=%s turn=%s)",
-                self.name, chat_id_str, _guest_caller_id, _turn_key)
-            await self._guest_busy_reply(guest_query_id)
-            return
+                self.name, chat_id_str, caller_id, _turn_key)
+            if inline_message_id is None:
+                await self._guest_busy_reply(guest_query_id)
+            return False
 
         # Register state, fire stub, route to skill layer.
         self._register_guest_turn(chat_id_str, _turn_key, guest_query_id)
         # Remembered for button taps: an inline-message callback carries no chat, and the tap must
         # be authorized against the same (user, chat, chat_type) tuple this message was gated on.
-        self._guest_chat_types[chat_id_str] = str(_guest_chat_type or "group")
+        self._guest_chat_types[chat_id_str] = str(chat_type or "group")
         self._known_guest_chats[chat_id_str] = time.time()
         while len(self._known_guest_chats) > self._GUEST_INLINE_MAP_MAX:
             self._known_guest_chats.pop(next(iter(self._known_guest_chats)), None)
 
         if not self._should_process_message(msg):
             self._release_guest_turn(_turn_key)
-            return
+            return False
 
         # Sentinel: False = slot open, stub not fired yet.
         # None = stub fired, Telegram returned no imi.  str = real imi.
-        self._guest_inline_message_ids[_turn_key] = False
+        # An adopted surface starts as that str: its query was already spent (on the card the
+        # operator just approved from), so no stub can fire and every write — progress, prompts,
+        # the reply — goes straight to the message already on screen.
+        self._guest_inline_message_ids[_turn_key] = inline_message_id or False
+        if inline_message_id:
+            self._remember_guest_inline_message(chat_id_str, inline_message_id)
+            self._remember_guest_surface_thread(
+                _turn_key, inline_message_id, None, chat_id=chat_id_str)
 
-        if _media_group_id and has_media:
-            self._guest_media_group_ids[_turn_key] = _media_group_id
+        if media_group_id and has_media:
+            self._guest_media_group_ids[_turn_key] = media_group_id
 
         event = self._build_message_event(
             msg, self._media_message_type(msg) if has_media else MessageType.TEXT,
@@ -8582,7 +8720,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Session isolation per guest caller falls out of _build_message_event for
         # free now: it reads user_id/user_name straight off msg.from_user, which is
-        # exactly _guest_caller_id's source above. build_session_key groups group
+        # exactly the caller_id this was gated on. build_session_key groups group
         # participants by user_id, so this alone gives guest turns the same
         # per-caller session keying ordinary group messages already get —
         # per-caller when group_sessions_per_user is on (the default), shared only
@@ -8622,7 +8760,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ),
                 log_label="slash-block reply",
             )
-            return
+            return False
 
         if has_media:
             # Downloading and caching an attachment (and running vision/STT over it) takes
@@ -8630,7 +8768,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # here so the caller sees the ⏳ straight away instead of silence.
             await self._guest_fire_text_stub(_turn_key)
             await self._cache_and_route_media(msg, event)
-            return
+            return False
 
         # Media on the message this one replies to. The member text path picks it up inside
         # _build_triggered_event; the guest path open-codes the event build (it cleans the trigger
@@ -8657,6 +8795,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+        return True
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""

@@ -1150,8 +1150,17 @@ gateway:
 
 Env equivalents: `TELEGRAM_GUEST_PARTICIPATION`, `TELEGRAM_GUEST_APPROVAL_CHAT`.
 
-The stranger gets told someone has to let them in, on the message they asked from — and you get a
-card in **your own chat**:
+The card goes to **both ends**, because you might be in either. In the chat that asked, on the
+message they asked from:
+
+```
+🙋 I don't know you yet — my owner has to let me answer here. I've asked them,
+and they can also decide right here. Only they can use these buttons.
+
+[ ✅ Allow ]  [ 🚫 Deny ]
+```
+
+and in **your own chat**, with the detail you need if you are not in that group:
 
 ```
 🙋 someone wants to use me in Test Group.
@@ -1163,26 +1172,33 @@ User id: 1234567
 [ ✅ Allow ]  [ 🚫 Deny ]
 ```
 
-It names who asked, which chat they asked from, what they were after, and the id you would revoke.
+Either copy resolves the request, and resolving one clears the other's buttons. So if you are in
+the group, you just tap **Allow** in place — no switching chats.
+
 A tap on a button they aren't allowed to use raises the same card, naming the action instead
 ("answer a question on “Pick a word”"), since a tap tells you nothing about who they are.
 
 - **Allow** grants exactly what `hermes pairing approve` grants: a pairing-store approval, honoured
   across every chat this bot serves and mirrored into `TELEGRAM_ALLOWED_USERS` when you have one
-  configured. Revoke it with `hermes pairing revoke telegram <id>`. Their waiting message changes
-  to say they can ask again — the request itself is not replayed, because a guest query is one-shot
-  and short-lived, so by the time you tap there is nothing left to answer with.
+  configured. Revoke it with `hermes pairing revoke telegram <id>`. Then their request **runs, on
+  that same message** — the card becomes the progress card and then the reply, exactly where they
+  asked. If the turn can't start (that conversation is already working, or message gating refused
+  it) the card says they can ask again instead. A grant that fails to save runs nothing: the grant
+  is the authorization.
 - **Deny** tells them no and silences that person in that chat for a day, so a card cannot be made
   to reappear by asking repeatedly.
 
-The card is only ever posted to your own chat, never to the chat that asked — it carries the button
-that grants access, so posting it there would let the asker approve themselves. If no approval chat
-is configured (no home channel, no `guest_approval_chat`) the request is skipped and the caller is
-denied exactly as before. Asking again while a request is open updates it rather than sending a
-second card, at most eight requests are pending at a time, and an unanswered one expires after 30
-minutes. Pending requests live in memory: a gateway restart clears them, and the person can ask
-again. Raising a request never authorizes anything — the caller is still denied, and whatever they
-send next runs through the same gate.
+**Why in-chat buttons are safe.** A tap is authorized on *who pressed it*, never on where the
+button sits: the stranger who raised the request is refused by the very gate that refused their
+message, and their tap can't rewrite the request it is asking about. What is never posted into the
+chat that asked is *your* copy — it names the chat, which would hand them an id they were not
+given. You need no home channel at all if you are in the group; with neither surface reachable the
+request is dropped and the caller is denied as before.
+
+Asking again while a request is open updates it rather than sending a second card, at most eight
+requests are pending at a time, and an unanswered one expires after 30 minutes. Pending requests
+live in memory: a gateway restart clears them, and the person can ask again. Raising a request
+never authorizes anything — the caller is still denied until someone taps Allow.
 
 **Attachments.** Images and files work in both directions:
 
