@@ -1119,6 +1119,252 @@ With `guest_mode: true`, a message from a non-allowlisted group is processed **o
 
 DMs and allowlisted groups behave exactly as before.
 
+### Guest bots: chats the bot never joined (Bot API 10.0)
+
+`guest_mode` also switches on Telegram's **guest bot** replies. Telegram delivers an @mention
+from a chat the bot is *not a member of* as a `guest_message` carrying a one-shot
+`guest_query_id`; Hermes answers it with a "⏳ Thinking…" placeholder, then edits that same
+message in place as the answer streams in. The bot never joins the chat and can see nothing
+but the messages that address it.
+
+**Who may use it.** Guest mode opens the bot to any chat that knows its @handle, so the caller
+— not just the chat — is authorized before anything runs, against the same allowlist the
+approval buttons use (`TELEGRAM_ALLOWED_USERS` / the group variants / `GATEWAY_ALLOWED_USERS`,
+unioned with the pairing store, `*` to open it to everyone). An empty allowlist or an
+unrecognized caller is denied, and the denial is logged with the caller id. Sessions are keyed
+per caller exactly as they are for ordinary group messages.
+
+**Letting other people in (`guest_participation`).** By default an unknown caller is simply
+dropped: from their side the bot ignored them, and you never learn they tried. Turn participation
+on and that dead end becomes a request you can answer from your phone:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_participation: true                 # default false
+        guest_participation_allow_always: false   # default false — see "Allow always" below
+        guest_participation_operator_copy: true   # default true
+        guest_approval_chat: "-1009876543210"     # default: your home channel
+```
+
+Env equivalents: `TELEGRAM_GUEST_PARTICIPATION`, `TELEGRAM_GUEST_PARTICIPATION_ALLOW_ALWAYS`,
+`TELEGRAM_GUEST_PARTICIPATION_OPERATOR_COPY`, `TELEGRAM_GUEST_APPROVAL_CHAT`.
+
+The card goes to **both ends**, because you might be in either. In the chat that asked, on the
+message they asked from:
+
+```
+🙋 I don't know you yet — my owner has to let me answer here. I've asked them,
+and they can also decide right here. Only they can use these buttons.
+
+[ ✅ Allow once ]
+[ 🚫 Deny ]
+```
+
+and in **your own chat**, with the detail you need if you are not in that group:
+
+```
+🙋 someone wants to use me in Test Group.
+
+They tried to ask: “what's the weather in Lisbon?”
+
+User id: 1234567
+
+Allow once runs just this request, as them. It grants nothing: their next
+message is refused again.
+
+[ ✅ Allow once ]
+[ 🚫 Deny ]
+```
+
+Either copy resolves the request, and resolving one clears the other's buttons. So if you are in
+the group, you just tap in place — no switching chats.
+
+A tap on a button they aren't allowed to use raises the same card, naming the question and the
+button they pressed instead ("answer a question with “1” on “Which one? 1. Left 2. Right”"), since a
+tap tells you nothing about who they are. **Allow once** on a tap lets exactly that one press
+through — their next tap of that button works, and nothing else does.
+
+- **Allow once** runs that one request **on that same message** — the card becomes the progress
+  card and then the reply, exactly where they asked — and grants nothing at all: no pairing-store
+  entry, no `.env` write, and their next message is gated again into a fresh card. Internally that
+  one request carries a single-event authorization so the gateway admits it without a grant; it is
+  never stored, never serialized, and never present on anything else they send. If there is
+  nothing left to run (a gateway restart dropped the pending request, or it came from a button tap,
+  which cannot be replayed) the card says so and still grants nothing. And if the request is
+  approved but never picked up, both cards say so within half a minute rather than sitting there
+  looking busy.
+- **Deny** tells them no and silences that person in that chat for a day, so a card cannot be made
+  to reappear by asking repeatedly.
+- **Allow always** is the durable grant and appears only with
+  `guest_participation_allow_always: true`, because it is not "let them ask me things": it grants
+  exactly what `hermes pairing approve` grants — every chat this bot serves, mirrored into
+  `TELEGRAM_ALLOWED_USERS` when you have one configured, which also lets that person answer exec
+  approvals and clarify prompts and DM the bot with the full toolset. Revoke with
+  `hermes pairing revoke telegram <id>`. A card drawn while the setting was on cannot still make
+  the grant after you turn it off.
+
+**What Allow once does and does not cover.** A question the approved request *asks* is part of that
+request, so the person it was approved for can answer it — by button or by typing, including
+"✏️ Other (type answer)". Nothing else moves: an **exec approval** raised inside that turn stays
+yours alone (what the machine may run is never the guest's call), another conversation's questions
+are not theirs, and their next message is refused again into a fresh card. Use **Allow always** for
+anyone who needs an ongoing back-and-forth.
+
+**Anyone in the group can use the buttons they're allowed to use.** Prompts are attributed by the
+prompt itself, not by the message a tap happened on — a Telegram `inline_message_id` is a reference
+into one viewer's own mailbox, so in a group every member sends a different id for the same message.
+Taps that match no live prompt (after a restart, or on a question that has since been answered or
+replaced) still get "this prompt expired", which is what they are.
+
+**Why in-chat buttons are safe.** A tap is authorized on *who pressed it*, never on where the
+button sits: the stranger who raised the request is refused by the very gate that refused their
+message, and their tap can't rewrite the request it is asking about. The chat that tap is judged
+against is the one the *request* names, not the one the tap arrived from — an in-chat card is an
+inline message and carries no chat of its own. What is never posted into the chat that asked is
+*your* copy: it names the chat, which would hand them an id they were not given.
+
+Set `guest_participation_operator_copy: false` to skip your copy entirely and leave the in-chat
+card as the only surface — useful when the home channel is busy with other things. Then only an
+authorized user who is **in that group** can resolve a request. You equally need no home channel at
+all if you are in the group; with neither surface reachable the request is dropped and the caller is
+denied as before.
+
+Asking again while a request is open updates it rather than sending a second card, at most eight
+requests are pending at a time, and an unanswered one expires after 30 minutes. Pending requests
+live in memory: a gateway restart clears them, and the person can ask again. Raising a request
+never authorizes anything — the caller is still denied until someone taps Allow.
+
+**Attachments.** Images and files work in both directions:
+
+- **Inbound** — a photo, voice note, video or document sent with the @mention takes the same
+  caching path a DM takes, so vision, transcription and document reading all behave as usual.
+  Albums arrive as one request.
+- **Outbound** — a `MEDIA:<path>` attachment can't be pushed into a chat the bot hasn't joined,
+  so Hermes uploads the file once to your **home channel** to mint a `file_id` and puts a button
+  on the reply. The asker taps it and receives the file in the chat. Only files written under
+  `HERMES_HOME/cache` can be staged this way; anything else is refused before it is read.
+
+The staging channel defaults to your configured home channel (`TELEGRAM_HOME_CHANNEL`).
+Point it somewhere else with:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_staging_chat: "-1009876543210"   # bot must be a member; default: home channel
+```
+
+Env equivalent: `TELEGRAM_GUEST_STAGING_CHAT`. Without a staging chat configured, guest replies
+stay text-only and attachments are refused with a log line rather than failing the turn.
+
+Delivery tokens behind the buttons are single-use, expire after 15 minutes, and are re-checked
+against the caller allowlist when redeemed, so a token read over someone's shoulder is useless
+to them.
+
+The button pre-fills `@yourbot deliver_<token>` in the asker's input box; sending it is what
+fetches the file. Enabling inline mode for the bot (BotFather → `/setinline`) makes that a single
+tap, and the same payload is then answered as an inline result too.
+
+**Prompts that need an answer.** A clarify question, an exec approval or a `/model`-style picker
+cannot be posted as a new message either, so it is drawn on that same inline message — text and
+inline keyboard together — and tapping a button edits it in place: first to the outcome of the tap,
+then to the final reply when the turn finishes. Taps are authorized against the same allowlist as
+the @mention that started the turn, and a tap that can no longer be traced back to its chat (after a
+gateway restart, say) is refused rather than evaluated without context. If there is no inline message
+to draw on at all, the prompt fails immediately and the agent is told so, instead of waiting on an
+answer to a question nobody could see.
+
+**One session per thread (`guest_thread_sessions`).** By default a guest chat has one session per
+caller, so every mention continues the same conversation. Turn this on and the chat behaves as if it
+had threads:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_thread_sessions: true   # default false
+```
+
+Env equivalent: `TELEGRAM_GUEST_THREAD_SESSIONS=true`. Guest mode only, and opt-in because switching
+it on changes how session keys are built — the guest sessions a chat already has are left behind by
+the change.
+
+With it on: a plain `@mention` starts a **new** conversation, with none of the earlier context.
+**Replying** to one of the bot's messages continues *that* conversation, including an older one the
+chat has since moved past. Button taps and typed answers to a question the bot asked are not new
+conversations either way — they belong to the turn that is waiting for them.
+
+A guest chat has no Telegram threads of its own (every bot message is a standalone inline message),
+so the thread a reply belongs to is recognised from the text the reply quotes back, remembered per
+message in `state.db` next to the sessions themselves. That means the link survives a gateway
+restart: replying to a message from yesterday continues yesterday's conversation, with its history,
+exactly as replying in a chat would. A reply the bot cannot place at all — the binding aged out
+after a month, or the chat was pruned — continues the chat's most recent conversation rather than
+starting over.
+
+Conversations also run **side by side**. Two unrelated mentions both get an answer, each on its own
+message, rather than the second being told to wait — that only happens when a second message lands
+in a conversation that is still working, where the two really would fight over one message. At most
+three conversations run at once per chat; a mention past that gets the "still working" reply.
+
+**Several questions at once.** The agent can ask a batch. A guest chat has only that one message
+to work with, so the batch walks through it: each question replaces the last, with the answers
+given so far kept above it, and only the question currently being waited on carries a keyboard.
+Writes to that message are ordered — a late "you answered X" can never land on top of the next
+question and take its buttons with it.
+
+**Typed answers.** Tapping `✏️ Other`, or answering an open-ended question, means typing into the
+chat while the turn is still running. That message is recognised as the answer the turn is waiting
+for and routed into it, so the turn resumes — and the reply moves with it: the bot answers your
+message, and everything after that (the rest of the reply, the batch's next question) is written
+there rather than in the card further up. The card you answered keeps whatever it last showed, as
+the record of where the interaction stood. A button tap creates no message, so a tapped answer
+stays in the card it was tapped on, exactly as before. Anything the prompt would not accept as an answer — a slash command, an
+attachment, an unrelated question while the buttons are still up — gets the usual "still working on
+a previous request" reply instead, so nothing is silently swallowed.
+
+Slash commands are not routed in guest chats — each command would consume a second reply slot —
+so the bot answers those with a short note instead.
+
+**Live progress on the placeholder.** A guest chat has exactly one message the bot may write to,
+so the per-tool progress bubbles and the "⏳ Working" heartbeat a private chat gets have nowhere of
+their own to go. They are folded into the placeholder instead, which turns into a small live card:
+
+```
+⏳ Working — 2 min — iteration 7/150
+
+💻 terminal: rg -n "guest_query" plugins/
+🔍 Searching the web for telegram guest bots
+📄 Reading adapter.py
+```
+
+The last three actions are kept, and the card is redrawn by editing that one message — at most once
+every 10 seconds, and only when the text actually changed, so a turn that sits in one long tool call
+costs about one edit a minute. It stops as soon as the answer starts arriving (the reply takes the
+message over) and retires for good if a question is drawn on it, so nothing ever paints over
+something the turn is waiting on. Turn it off, or change the cadence, with:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        guest_mode: true
+        guest_progress_card: true              # default true
+        guest_progress_interval_seconds: 10    # default 10, minimum 1
+```
+
+Env equivalents: `TELEGRAM_GUEST_PROGRESS_CARD`, `TELEGRAM_GUEST_PROGRESS_INTERVAL_SECONDS`. With
+the card off, a guest turn shows the plain "⏳ Thinking…" placeholder until the reply replaces it.
+
 ## Slash Command Access Control
 
 By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the platform's `extra` block:

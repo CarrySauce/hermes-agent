@@ -100,6 +100,128 @@ class SessionTelegramTopicsMixin:
     tables (nobody ran ``/topic``) by returning their empty value; only
     ``enable``/``bind`` run the migration."""
 
+    # -- Guest thread bindings ------------------------------------------------
+    #
+    # Which guest conversation a message of the bot's belongs to. Same shape as the DM topic
+    # bindings above ("which thread is this chat message part of") and persisted for the same
+    # reason: the SESSION behind a guest thread already survives a restart in this database, so
+    # only the binding was volatile — which is what made a reply to an older message after a
+    # restart start a new conversation instead of continuing its own.
+    #
+    # ``surface_key`` is the bot message the binding is about: an ``inline_message_id`` for a
+    # message the bot wrote, or ``msg:<message_id>`` for a reply target it has since recognised.
+    _GUEST_THREAD_TABLE = "telegram_guest_thread_binding"
+    _GUEST_THREAD_DDL = """
+                    profile_name TEXT NOT NULL DEFAULT 'default',
+                    chat_id TEXT NOT NULL,
+                    surface_key TEXT NOT NULL,
+                    thread_token TEXT NOT NULL,
+                    text_key TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (profile_name, chat_id, surface_key)
+    """
+    # A guest chat's bindings are routing hints, not history: old ones only make a stale thread
+    # reachable, so they age out and are capped per chat.
+    _GUEST_THREAD_RETAIN_SECONDS = 30 * 24 * 3600
+    _GUEST_THREAD_MAX_PER_CHAT = 512
+
+    def apply_telegram_guest_thread_migration(self) -> None:
+        """Create the guest thread binding table. Lazy, like the topic tables: a gateway that
+        never turns guest thread sessions on never grows it."""
+        table, ddl = self._GUEST_THREAD_TABLE, self._GUEST_THREAD_DDL
+
+        def _do(conn):
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")
+            conn.executescript(f"""
+                CREATE INDEX IF NOT EXISTS idx_telegram_guest_thread_text
+                ON {table}(profile_name, chat_id, text_key);
+
+                CREATE INDEX IF NOT EXISTS idx_telegram_guest_thread_recent
+                ON {table}(profile_name, chat_id, updated_at);
+                """)
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("telegram_guest_thread_schema_version", "1"),
+            )
+        self._execute_write(_do)
+
+    def record_telegram_guest_thread(
+        self, *, chat_id: str, surface_key: str, thread_token: str, text_key: Optional[str] = None,
+        profile_name: str = "default",
+    ) -> None:
+        """Bind *surface_key* (and the text on it) to *thread_token*, then prune the chat's old rows."""
+        if not chat_id or not surface_key or not thread_token:
+            return
+        self.apply_telegram_guest_thread_migration()
+        table = self._GUEST_THREAD_TABLE
+        profile = _normalize_telegram_topic_profile_name(profile_name)
+        cid, now = str(chat_id), time.time()
+
+        def _do(conn):
+            conn.execute(
+                f"INSERT INTO {table} (profile_name, chat_id, surface_key, thread_token, text_key, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_name, chat_id, surface_key) DO UPDATE SET "
+                "  thread_token = excluded.thread_token, "
+                # A later write without text (a message-id memo) must not erase the text a
+                # surface row was found by.
+                f"  text_key = COALESCE(excluded.text_key, {table}.text_key), "
+                "  updated_at = excluded.updated_at",
+                (profile, cid, str(surface_key), str(thread_token),
+                 str(text_key) if text_key else None, now),
+            )
+            conn.execute(
+                f"DELETE FROM {table} WHERE profile_name = ? AND chat_id = ? AND updated_at < ?",
+                (profile, cid, now - self._GUEST_THREAD_RETAIN_SECONDS),
+            )
+            conn.execute(
+                f"DELETE FROM {table} WHERE profile_name = ? AND chat_id = ? AND surface_key NOT IN "
+                f"(SELECT surface_key FROM {table} WHERE profile_name = ? AND chat_id = ? "
+                " ORDER BY updated_at DESC LIMIT ?)",
+                (profile, cid, profile, cid, self._GUEST_THREAD_MAX_PER_CHAT),
+            )
+        self._execute_write(_do)
+
+    def lookup_telegram_guest_thread(
+        self, *, chat_id: str, surface_key: Optional[str] = None, text_key: Optional[str] = None,
+        profile_name: str = "default",
+    ) -> Optional[str]:
+        """Thread token bound to *surface_key*, else to *text_key*, else None.
+
+        Surface first: an exact message is a stronger claim than text that two of the bot's
+        messages could share.
+        """
+        if not chat_id or not (surface_key or text_key):
+            return None
+        table = self._GUEST_THREAD_TABLE
+        profile = _normalize_telegram_topic_profile_name(profile_name)
+        cid = str(chat_id)
+        for column, value in (("surface_key", surface_key), ("text_key", text_key)):
+            if not value:
+                continue
+            row = self._topic_read_one(
+                f"SELECT thread_token FROM {table} "
+                f"WHERE profile_name = ? AND chat_id = ? AND {column} = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (profile, cid, str(value)),
+            )
+            if row and row[0]:
+                return str(row[0])
+        return None
+
+    def latest_telegram_guest_thread(self, *, chat_id: str, profile_name: str = "default") -> Optional[str]:
+        """The chat's most recently written thread token — the fallback for a reply to the bot
+        that cannot be placed any other way."""
+        if not chat_id:
+            return None
+        row = self._topic_read_one(
+            f"SELECT thread_token FROM {self._GUEST_THREAD_TABLE} "
+            "WHERE profile_name = ? AND chat_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id)),
+        )
+        return str(row[0]) if row and row[0] else None
+
     def _topic_read_one(self, sql: str, params):
         """``fetchone`` that treats an unmigrated table as None."""
         try:
