@@ -116,21 +116,52 @@ async def test_the_stranger_cannot_send_a_second_request_at_all(monkeypatch):
     assert enqueued == []
 
 
+def _stranger_tap(adapter, data):
+    tap = MagicMock()
+    tap.message, tap.inline_message_id, tap.data = None, "imi_wait", data
+    tap.from_user = MagicMock(id=int(STRANGER), first_name="Stranger", username="someone")
+    tap.answer, tap.edit_message_text = AsyncMock(), AsyncMock()
+    return tap
+
+
 @pytest.mark.asyncio
-async def test_a_clarify_prompt_inside_that_turn_stays_operator_only(monkeypatch):
-    """Allow once authorized a request, not a person: a question it raises is not theirs to answer."""
+async def test_the_approved_author_may_answer_their_own_turns_clarify(monkeypatch):
+    """A question the approved request asks is part of that request, so its author answers it."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", OPERATOR)
     adapter = _participation_adapter()
     await _allow_once_event(adapter)
     adapter._remember_guest_inline_message("42", "imi_wait", prompt_text="Which one?")
-    tap = MagicMock()
-    tap.message, tap.inline_message_id, tap.data = None, "imi_wait", "cl:q0:0"
-    tap.from_user = MagicMock(id=int(STRANGER), first_name="Stranger", username="someone")
-    tap.answer, tap.edit_message_text = AsyncMock(), AsyncMock()
+    tap = _stranger_tap(adapter, "cl:q0:0")
 
-    allowed = await adapter._callback_authorized(tap, adapter._callback_ctx(tap), "nope")
+    assert await adapter._callback_authorized(tap, adapter._callback_ctx(tap), "nope") is True
 
-    assert allowed is False
+
+@pytest.mark.asyncio
+async def test_an_exec_approval_in_that_turn_stays_operator_only(monkeypatch):
+    """What the machine may do is never the guest's call, however their request was approved."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", OPERATOR)
+    adapter = _participation_adapter()
+    await _allow_once_event(adapter)
+    adapter._remember_guest_inline_message("42", "imi_wait", prompt_text="Run rm -rf?")
+    tap = _stranger_tap(adapter, "ea:once:17")
+
+    assert await adapter._callback_authorized(tap, adapter._callback_ctx(tap), "nope") is False
+
+
+@pytest.mark.asyncio
+async def test_another_turns_clarify_is_not_theirs_to_answer(monkeypatch):
+    """The opening is scoped to the turn that was approved, not to the person."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", OPERATOR)
+    adapter = _participation_adapter()
+    await _allow_once_event(adapter)
+    # Someone else's conversation, live in the same chat.
+    adapter._register_guest_turn("42", "g9other", "gq_other")
+    adapter._guest_prompt_taps["cl:other:0"] = {
+        "chat_id": "42", "chat_type": "supergroup", "guest_turn_key": "g9other",
+        "prompt_key": "g9other#1", "label": "Left", "text": "Which one?"}
+    tap = _stranger_tap(adapter, "cl:other:0")
+
+    assert await adapter._callback_authorized(tap, adapter._callback_ctx(tap), "nope") is False
 
 
 @pytest.mark.asyncio

@@ -1183,8 +1183,10 @@ message is refused again.
 Either copy resolves the request, and resolving one clears the other's buttons. So if you are in
 the group, you just tap in place — no switching chats.
 
-A tap on a button they aren't allowed to use raises the same card, naming the action instead
-("answer a question on “Pick a word”"), since a tap tells you nothing about who they are.
+A tap on a button they aren't allowed to use raises the same card, naming the question and the
+button they pressed instead ("answer a question with “1” on “Which one? 1. Left 2. Right”"), since a
+tap tells you nothing about who they are. **Allow once** on a tap lets exactly that one press
+through — their next tap of that button works, and nothing else does.
 
 - **Allow once** runs that one request **on that same message** — the card becomes the progress
   card and then the reply, exactly where they asked — and grants nothing at all: no pairing-store
@@ -1205,10 +1207,18 @@ A tap on a button they aren't allowed to use raises the same card, naming the ac
   `hermes pairing revoke telegram <id>`. A card drawn while the setting was on cannot still make
   the grant after you turn it off.
 
-**What Allow once does not do.** It authorizes the one request in front of you and nothing else, so
-inside that turn the guest is still an unauthorized user: a clarify question or an exec approval
-raised by their own request is answerable only by someone already allowed, and a typed answer from
-them is refused. Use **Allow always** for anyone who needs a back-and-forth.
+**What Allow once does and does not cover.** A question the approved request *asks* is part of that
+request, so the person it was approved for can answer it — by button or by typing, including
+"✏️ Other (type answer)". Nothing else moves: an **exec approval** raised inside that turn stays
+yours alone (what the machine may run is never the guest's call), another conversation's questions
+are not theirs, and their next message is refused again into a fresh card. Use **Allow always** for
+anyone who needs an ongoing back-and-forth.
+
+**Anyone in the group can use the buttons they're allowed to use.** Prompts are attributed by the
+prompt itself, not by the message a tap happened on — a Telegram `inline_message_id` is a reference
+into one viewer's own mailbox, so in a group every member sends a different id for the same message.
+Taps that match no live prompt (after a restart, or on a question that has since been answered or
+replaced) still get "this prompt expired", which is what they are.
 
 **Why in-chat buttons are safe.** A tap is authorized on *who pressed it*, never on where the
 button sits: the stranger who raised the request is refused by the very gate that refused their

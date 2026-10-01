@@ -4747,29 +4747,35 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         query_message = getattr(query, "message", None)
         if query_message is None:
-            guest = self._guest_context_for_inline_message(getattr(query, "inline_message_id", None))
+            imi = getattr(query, "inline_message_id", None)
+            # The prompt first: its record names the turn that drew it, which is exact. The surface
+            # map is the fallback, and it only ever holds the query AUTHOR's view of the message —
+            # an id is per-viewer, so anybody else's tap carries one this adapter never saw.
+            tap = self._guest_prompt_tap_context(getattr(query, "data", None))
+            if tap is not None:
+                guest, turn_key = tap, tap.get("guest_turn_key")
+            else:
+                guest = self._guest_context_for_inline_message(imi)
+                # The tap identifies its conversation by the surface it happened on, which is then
+                # the only handle it carries — and with two conversations live, the chat is not one.
+                turn_key = self._guest_turn_key(
+                    inline_message_id=imi, chat_id=(guest or {}).get("chat_id"))
             return {
                 "chat_id": (guest or {}).get("chat_id"), "chat_type": (guest or {}).get("chat_type"),
                 "thread_id": None, "user_name": getattr(getattr(query, "from_user", None), "first_name", None),
-                # The tap identifies its conversation by the surface it happened on, which is the
-                # only handle it carries — and with two conversations live, the chat is not one.
-                "guest_turn_key": self._guest_turn_key(
-                    inline_message_id=getattr(query, "inline_message_id", None),
-                    chat_id=(guest or {}).get("chat_id")),
+                "guest_turn_key": turn_key,
                 # Read BEFORE the handler resolves anything: resolving releases the thread that
                 # draws the batch's next question, and whatever this tap decides to write is
                 # stale from that moment on.
-                "guest_generation": self._guest_surface_generation(
-                    self._guest_turn_key(
-                        inline_message_id=getattr(query, "inline_message_id", None),
-                        chat_id=(guest or {}).get("chat_id")) or "")}
+                "guest_generation": self._guest_surface_generation(turn_key or ""),
+                "guest_prompt_key": (guest or {}).get("prompt_key")}
         query_chat = getattr(query_message, "chat", None)
         return {
             "chat_id": getattr(query_message, "chat_id", None), "chat_type": getattr(query_chat, "type", None),
             "thread_id": getattr(query_message, "message_thread_id", None),
             "user_name": getattr(query.from_user, "first_name", None),
             # An ordinary chat gives every card its own message, so there is nothing to race for.
-            "guest_generation": None, "guest_turn_key": None}
+            "guest_generation": None, "guest_turn_key": None, "guest_prompt_key": None}
 
     def _callback_prompt_text(self, query) -> str:
         """Text of the message a tap came from — ``query.message.text``, or, for an inline
@@ -4778,28 +4784,91 @@ class TelegramAdapter(BasePlatformAdapter):
         query_message = getattr(query, "message", None)
         if query_message is not None:
             return getattr(query_message, "text", None) or ""
+        tap = self._guest_prompt_tap_context(getattr(query, "data", None))
+        if tap is not None and tap.get("text"):
+            return str(tap["text"])
         inline_message_id = getattr(query, "inline_message_id", None)
         return (self._guest_prompt_texts.get(str(inline_message_id)) or "") if inline_message_id else ""
+
+    _GUEST_TAP_GRANT_TTL_SECONDS = 30 * 60
+
+    def _guest_tap_grant_key(self, user_id: Any, prompt_key: Any) -> tuple:
+        return (str(user_id or ""), str(prompt_key or ""))
+
+    def _grant_guest_tap(self, user_id: Any, prompt_key: Any) -> bool:
+        """Let this person's next tap on this one prompt through. False when there is no prompt.
+
+        What "Allow once" means for a request raised by a TAP: the operator approved one button
+        press, so one press is what it buys. Not a grant — it names a single prompt, it is consumed
+        by the tap that uses it, and it dies with that prompt.
+        """
+        self._ensure_guest_state()
+        if not (user_id and prompt_key):
+            return False
+        self._guest_tap_grants[self._guest_tap_grant_key(user_id, prompt_key)] = (
+            time.monotonic() + self._GUEST_TAP_GRANT_TTL_SECONDS)
+        while len(self._guest_tap_grants) > self._GUEST_INLINE_MAP_MAX:
+            self._guest_tap_grants.pop(next(iter(self._guest_tap_grants)), None)
+        return True
+
+    def _consume_guest_tap_grant(self, user_id: Any, prompt_key: Any) -> bool:
+        """Spend a one-shot tap grant, if this person has one for this prompt."""
+        self._ensure_guest_state()
+        slot = self._guest_tap_grant_key(user_id, prompt_key)
+        expiry = self._guest_tap_grants.pop(slot, None)
+        if expiry is None:
+            return False
+        if expiry < time.monotonic():
+            return False
+        logger.info(
+            "[%s] Guest tap allowed once by an operator (user=%s prompt=%s)",
+            self.name, slot[0], slot[1])
+        return True
+
+    def _guest_allow_once_can_answer(self, query, cb: Dict[str, Any]) -> bool:
+        """Whether this is the approved author answering a question their own request asked.
+
+        An operator who taps "Allow once" approves a REQUEST, and a clarify question raised inside
+        it is part of that request — so the person it was approved for may answer it. Clarify only:
+        an exec approval is the operator's decision about what the machine may do, never the
+        guest's, and no other turn or prompt is reachable from here.
+        """
+        turn_key = cb.get("guest_turn_key")
+        if not turn_key or not str(getattr(query, "data", "") or "").startswith("cl:"):
+            return False
+        self._ensure_guest_state()
+        return self._guest_allow_once_authors.get(str(turn_key)) == str(
+            getattr(getattr(query, "from_user", None), "id", "") or "")
 
     async def _callback_authorized(
         self, query, cb: Dict[str, Any], denial_text: str, *, participation: bool = True) -> bool:
         """Gate a button tap on the callback allowlist; answers ``denial_text`` when refused.
 
-        With guest participation on, a refusal in a GUEST chat additionally asks the operator to let
-        the person in, and says so instead of the flat denial — the tap itself is not replayed (the
-        answer it would have given belongs to a turn that is still waiting), so the toast tells them
-        to try again. Only in a guest chat: the approval buttons themselves live in the operator's
-        own chat, and a request raised from a tap there would be asking about the approver.
+        Three narrow openings sit beside the allowlist, all of them an operator's own decision made
+        earlier: the author of an "Allow once" turn answering a question that turn asked, a one-shot
+        grant the operator minted for exactly this person and prompt, and — with participation on,
+        in a guest chat — turning the refusal itself into a request they can approve. The last says
+        so instead of the flat denial, since the tap is not replayed. Never in the operator's own
+        chat: the approval buttons live there, and a request raised from a tap on one would be
+        asking whether to approve the approver.
         """
         if self._is_callback_user_authorized(
             str(getattr(query.from_user, "id", "")), chat_id=cb["chat_id"],
             chat_type=str(cb["chat_type"]) if cb["chat_type"] is not None else None,
             thread_id=str(cb["thread_id"]) if cb["thread_id"] is not None else None, user_name=cb["user_name"]):
             return True
+        if self._guest_allow_once_can_answer(query, cb):
+            return True
+        if self._consume_guest_tap_grant(
+                getattr(getattr(query, "from_user", None), "id", None), cb.get("guest_prompt_key")):
+            return True
         if participation and cb.get("chat_id") is not None and self._is_guest_chat(cb["chat_id"]) and await self._request_guest_participation(
             chat_id=cb["chat_id"], chat_type=cb.get("chat_type"),
             user_id=getattr(query.from_user, "id", None), user_name=cb.get("user_name"),
             what=self._guest_tap_what(query),
+            # A tap cannot be replayed — the answer belongs to a turn that is still waiting — but it
+            # can be let through once, so "try again once they do" becomes true rather than looping.
+            tap={"prompt_key": cb.get("guest_prompt_key")},
         ):
             await query.answer(text="🙋 I've asked my owner to let you in — try again once they do.")
             return False
@@ -4851,10 +4920,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
-        """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
+        """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired.
+
+        A claim that CONSUMES the pending entry (``pop``) has resolved that prompt for good, so its
+        guest tap records and any one-shot grant on it go with it. Clarify keeps its entry (a batch
+        reuses it, and "✏️ Other" expects a message next), so its buttons stay tappable until the
+        next draw supersedes them.
+        """
         if not await self._callback_authorized(query, cb, denial):
             return None
         session_key = state.pop(key, None) if pop else state.get(key)
+        if session_key and pop:
+            self._drop_guest_prompt_taps(cb.get("guest_prompt_key"))
         if not session_key:
             await query.answer(text=resolved)
         return session_key
@@ -5862,7 +5939,8 @@ class TelegramAdapter(BasePlatformAdapter):
         ("_guest_answered_lines", dict), ("_guest_prompt_undeliverable", set),
         ("_guest_progress_cards", dict),
         ("_guest_participation_requests", dict), ("_guest_participation_declined", dict),
-        ("_guest_turn_activity", dict),
+        ("_guest_turn_activity", dict), ("_guest_prompt_taps", dict), ("_guest_prompt_seq", int),
+        ("_guest_tap_grants", dict), ("_guest_allow_once_authors", dict),
         ("_seen_guest_update_ids", set), ("_last_guest_update_id", int),
     )
 
@@ -6006,6 +6084,10 @@ class TelegramAdapter(BasePlatformAdapter):
         ):
             store.pop(key, None)
         self._guest_prompt_undeliverable.discard(key)
+        self._guest_allow_once_authors.pop(key, None)
+        for data, entry in list(self._guest_prompt_taps.items()):
+            if entry.get("guest_turn_key") == key:
+                self._drop_guest_prompt_taps(entry.get("prompt_key"))
         self._guest_turn_chats.pop(key, None)
         live = self._guest_turns_by_chat.get(cid) or []
         if key in live:
@@ -7851,11 +7933,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return f"ask: “{summary}”" if summary else "send me something"
 
     def _guest_tap_what(self, query) -> str:
-        """What an unauthorized button tap was trying to do, for the operator's card."""
+        """What an unauthorized button tap was trying to do, for the operator's card.
+
+        The button's own label is named where it is known: deciding whether to let someone press
+        "Left" on "Which one?" is a different question from letting them press anything at all.
+        """
         payload = str(getattr(query, "data", None) or "")
         action = next(
             (label for prefix, label in self._GUEST_TAP_ACTIONS if payload.startswith(prefix)),
             "use a button")
+        button = str((self._guest_prompt_tap_context(payload) or {}).get("label") or "").strip()
+        if button:
+            action = f"{action} with “{self._guest_participation_summary(button)}”"
         prompt = self._guest_participation_summary(self._callback_prompt_text(query))
         return f"{action} on “{prompt}”" if prompt else action
 
@@ -7897,7 +7986,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _request_guest_participation(
         self, *, chat_id: Any, chat_type: Any, user_id: Any, user_name: Any, what: str,
         chat_title: Any = None, guest_query_id: Optional[str] = None,
-        replay: Optional[Dict[str, Any]] = None,
+        replay: Optional[Dict[str, Any]] = None, tap: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Ask the operator to let this person in. True when a request is now pending for them.
 
@@ -7906,8 +7995,9 @@ class TelegramAdapter(BasePlatformAdapter):
         way the caller is denied: approval is a separate tap.
 
         ``replay`` carries what it takes to run the request once approved (the message, its update,
-        and the query it arrived with). Without it an approval only grants access and the caller
-        asks again.
+        and the query it arrived with); ``tap`` names the prompt a refused button press was on, which
+        is what "Allow once" lets through instead. With neither, an approval only grants access and
+        the caller starts over.
         """
         if not (self._telegram_guest_mode() and self._telegram_guest_participation()):
             return False
@@ -7929,6 +8019,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Asking twice is the same ask: refresh what they are waiting on and re-acknowledge,
             # never a second card in the operator's chat.
             self._guest_participation_requests[existing]["what"] = what
+            if replay is not None:
+                self._guest_participation_requests[existing]["replay"] = replay
+            if tap is not None:
+                self._guest_participation_requests[existing]["tap"] = tap
             await self._answer_guest_participation_wait(guest_query_id, existing)
             return True
         if len(self._guest_participation_requests) >= self._GUEST_PARTICIPATION_MAX_PENDING:
@@ -7943,6 +8037,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "user_name": str(user_name or "").strip(), "what": what,
             "created": time.time(), "inline_message_id": None,
             "operator_chat": None, "operator_message_id": None, "replay": replay or None,
+            "tap": tap or None,
         }
         # Stored before either card goes out: their buttons carry this id, and a tap can land
         # before the call that drew them returns.
@@ -8298,6 +8393,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # blocked — so it never runs.
         granted = await self._grant_guest_participation(record["user_id"], record["user_name"]) if always else True
         replayed = await self._replay_guest_request(record, always=always) if granted else False
+        # Nothing to replay, but a button press to let through: the request came from a tap, and
+        # one tap is exactly what the operator approved.
+        tapped = (
+            not replayed and granted and not always
+            and self._grant_guest_tap(record["user_id"], (record.get("tap") or {}).get("prompt_key")))
         if not granted:
             await query.answer(text="⚠️ Could not save that grant")
             await self._resolve_guest_participation_cards(
@@ -8317,6 +8417,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text=f"✅ Running it for {who}")
             detail = f"✅ {operator} allowed one request from {who}. It is running now."
             guest_card_text = None
+        elif tapped:
+            await query.answer(text=f"✅ {who} may press that once")
+            detail = (
+                f"✅ {operator} allowed {who} one press of that button. Nothing else was granted — "
+                "their next message is refused again.")
+            guest_card_text = "✅ Go ahead — press that button again."
         else:
             # Nothing left to run: the request outlived its payload (a restart drops it) or it came
             # from a button tap, which cannot be replayed. Granting nothing is the point of Allow
@@ -8384,11 +8490,73 @@ class TelegramAdapter(BasePlatformAdapter):
             for q, a in lines if q or a)
         return f"{rendered}\n\n" if rendered else ""
 
+    # A tap is attributed by the PROMPT it is on, never by the message it happened on. An
+    # ``inline_message_id`` is a reference into ONE viewer's mailbox — in a basic group every member
+    # has their own numbering — so the id a second person's client sends for the same message is one
+    # this adapter has never seen. That made every tap by anybody but the query author
+    # "unattributable", answered "this prompt expired" on a perfectly live question, and left an
+    # Allow-once turn's prompts tappable by nobody at all (its author is the stranger).
+    #
+    # The callback data is the same for every viewer and each button's is unique to the prompt
+    # instance that drew it, so recording buttons by their own data needs no parsing: a lookup
+    # either knows the prompt or does not, and "does not" is a real expiry.
+
+    def _record_guest_prompt_taps(self, turn_key: str, keyboard: Any, text: str) -> Optional[str]:
+        """Record this draw's buttons against the turn that drew them; returns their prompt key.
+
+        The prompt key groups one draw's buttons so a one-shot grant can be scoped to the prompt a
+        person actually tapped. A new draw on the same turn supersedes the old one, which is also
+        how a resolved question stops being tappable.
+        """
+        self._ensure_guest_state()
+        rows = getattr(keyboard, "inline_keyboard", None) or ()
+        buttons = [
+            (str(getattr(b, "callback_data", "") or ""), str(getattr(b, "text", "") or ""))
+            for row in rows for b in row]
+        buttons = [(data, label) for data, label in buttons if data]
+        if not buttons:
+            return None
+        key = str(turn_key)
+        # Supersede this turn's previous draw: one guest surface shows one prompt at a time, so the
+        # question that was there is gone and a late tap on it is genuinely expired.
+        for data, entry in list(self._guest_prompt_taps.items()):
+            if entry.get("guest_turn_key") == key:
+                self._guest_prompt_taps.pop(data, None)
+        self._guest_prompt_seq += 1
+        prompt_key = f"{key}#{self._guest_prompt_seq}"
+        chat_id = self._guest_chat_for_turn(key)
+        for data, label in buttons:
+            self._guest_prompt_taps[data] = {
+                "chat_id": chat_id, "chat_type": self._guest_chat_types.get(chat_id, "group"),
+                "guest_turn_key": key, "prompt_key": prompt_key, "label": label, "text": text,
+            }
+        while len(self._guest_prompt_taps) > self._GUEST_INLINE_MAP_MAX:
+            self._guest_prompt_taps.pop(next(iter(self._guest_prompt_taps)), None)
+        return prompt_key
+
+    def _guest_prompt_tap_context(self, data: Any) -> Optional[Dict[str, Any]]:
+        """The prompt context recorded for this exact callback data, or None."""
+        self._ensure_guest_state()
+        return self._guest_prompt_taps.get(str(data or "")) if data else None
+
+    def _drop_guest_prompt_taps(self, prompt_key: Any) -> None:
+        """Forget one resolved prompt's buttons, so a second tap on it reads as resolved."""
+        if not prompt_key:
+            return
+        self._ensure_guest_state()
+        for data, entry in list(self._guest_prompt_taps.items()):
+            if entry.get("prompt_key") == str(prompt_key):
+                self._guest_prompt_taps.pop(data, None)
+        for grant in [g for g in self._guest_tap_grants if g[1] == str(prompt_key)]:
+            self._guest_tap_grants.pop(grant, None)
+
     def _finish_guest_prompt(
         self, turn_key: str, inline_message_id: str, text: str, on_sent, *, parse_mode: Any,
+        keyboard: Any = None,
     ) -> None:
         """Bookkeeping after a guest prompt is on screen: retarget edits, record the tap context."""
         key = str(turn_key)
+        self._record_guest_prompt_taps(key, keyboard, text)
         chat_id = self._guest_chat_for_turn(key)
         self._guest_inline_message_ids[key] = inline_message_id
         # Newest content on the surface: anything decided before this point is now stale.
@@ -8442,7 +8610,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] %s: no inline message to draw on in guest chat %s (turn=%s) — prompt undeliverable",
                     self.name, what, cid, _tk)
                 return SendResult(success=False, error="guest_no_inline_message")
-            self._finish_guest_prompt(_tk, imi, text, on_sent, parse_mode=parse_mode)
+            self._finish_guest_prompt(
+                _tk, imi, text, on_sent, parse_mode=parse_mode, keyboard=keyboard)
             return SendResult(success=True, message_id=None)
         try:
             await self._bot.edit_message_text(
@@ -8457,7 +8626,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] %s: guest inline edit failed (imi=%s turn=%s): %s",
                 self.name, what, imi, _tk, _redact_telegram_error_text(exc))
             return SendResult(success=False, error=_redact_telegram_error_text(exc))
-        self._finish_guest_prompt(_tk, imi, text, on_sent, parse_mode=parse_mode)
+        self._finish_guest_prompt(_tk, imi, text, on_sent, parse_mode=parse_mode, keyboard=keyboard)
         logger.info(
             "[%s] %s drawn on the guest inline message (chat=%s turn=%s)", self.name, what, cid, _tk)
         return SendResult(success=True, message_id=None)
@@ -8615,6 +8784,55 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clarify-continuation check failed", self.name, exc_info=True)
             return False
 
+    async def _route_guest_clarify_continuation(
+        self, chat_id_str: str, pair: tuple, guest_query_id: str) -> None:
+        """Route a typed answer into the turn that is blocked waiting for it."""
+        continuation, turn_key = pair
+        # Same reason as the button path: record the answer BEFORE the gateway intercept resolves
+        # it, so the batch's next question can keep it on screen. The predicate has already
+        # established this text resolves that turn's pending question.
+        self._record_guest_answer(
+            turn_key, self._pending_guest_question(continuation), continuation.text)
+        # Answer the fresh query this message arrived with, and move the turn onto the message that
+        # answer produces: the reply belongs under the text it answers, not in a card further up the
+        # chat. Before the enqueue, so the resumed turn — its stream edits, the batch's next
+        # question, the final flush — all read the new surface. A failed migration keeps the old one
+        # rather than losing the reply.
+        await self._migrate_guest_surface(turn_key, guest_query_id)
+        logger.info(
+            "[%s] Guest clarify continuation routed into the in-flight turn (chat=%s turn=%s)",
+            self.name, chat_id_str, turn_key)
+        self._enqueue_text_event(self._apply_telegram_group_observe_attribution(continuation))
+
+    async def _route_guest_allow_once_answer(
+        self, chat_id_str: str, msg: Any, update: Any, guest_query_id: str, caller_id: str) -> bool:
+        """Route a typed clarify answer from the author of an Allow-once turn. True when routed.
+
+        Their buttons already work (``_guest_allow_once_can_answer``); "✏️ Other (type answer)" asks
+        for a message instead, and that message meets the guest gate long before the continuation
+        branch runs. So the same opening is offered here on the same terms: a live turn that is this
+        person's own approved request, a question it is waiting on, and nothing else — the predicate
+        is what establishes that this text resolves that turn's pending clarify, so an unrelated
+        message from them still gets the ordinary refusal.
+        """
+        self._ensure_guest_state()
+        # Cost, not security: the check that matters is the one below, on the turn the pending
+        # question actually belongs to. This only avoids building a candidate event per live turn
+        # for every unauthorized message in the chat.
+        if not any(
+            self._guest_allow_once_authors.get(key) == str(caller_id)
+            for key in self._guest_live_turn_keys(chat_id_str)
+        ):
+            return False
+        pair = self._guest_clarify_continuation_for(chat_id_str, msg, update)
+        if pair is None or self._guest_allow_once_authors.get(str(pair[1])) != str(caller_id):
+            return False
+        logger.info(
+            "[%s] Typed answer from an allowed-once author routed into their own turn "
+            "(chat=%s turn=%s user=%s)", self.name, chat_id_str, pair[1], caller_id)
+        await self._route_guest_clarify_continuation(chat_id_str, pair, guest_query_id)
+        return True
+
     async def _guest_busy_reply(self, guest_query_id: str) -> None:
         """Tell the caller their conversation is still working, and why nothing is happening yet."""
         await self._answer_guest_query(
@@ -8735,6 +8953,11 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_type=str(_guest_chat_type) if _guest_chat_type is not None else "group",
             user_name=(getattr(msg.from_user, "username", None) or getattr(msg.from_user, "first_name", None)),
         ):
+            # One narrow opening before the refusal: the person whose request an operator allowed
+            # once may TYPE the answer to a question that request asked, exactly as they may tap it.
+            if not has_media and await self._route_guest_allow_once_answer(
+                    chat_id_str, msg, update, guest_query_id, _guest_caller_id):
+                return
             # Loud + diagnostic: if from_user is ever absent on a guest message
             # (e.g. an anonymous-admin edge case), logging that makes a silent
             # deny-all instantly traceable rather than looking like a backend outage.
@@ -8803,22 +9026,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # chat no longer has a single "the" pending clarify.
             _continuation_pair = self._guest_clarify_continuation_for(chat_id_str, msg, update)
             if _continuation_pair is not None:
-                _continuation, _continuation_turn = _continuation_pair
-                # Same reason as the button path: record the answer BEFORE the gateway intercept
-                # resolves it, so the batch's next question can keep it on screen. The predicate
-                # has already established this text resolves that turn's pending question.
-                self._record_guest_answer(
-                    _continuation_turn, self._pending_guest_question(_continuation), _continuation.text)
-                # Answer the fresh query this message arrived with, and move the turn onto the
-                # message that answer produces: the reply belongs under the text it answers, not
-                # in a card further up the chat. Before the enqueue below, so the resumed turn —
-                # its stream edits, the batch's next question, the final flush — all read the new
-                # surface. A failed migration keeps the old one rather than losing the reply.
-                await self._migrate_guest_surface(_continuation_turn, guest_query_id)
-                logger.info(
-                    "[%s] Guest clarify continuation routed into the in-flight turn (chat=%s turn=%s)",
-                    self.name, chat_id_str, _continuation_turn)
-                self._enqueue_text_event(self._apply_telegram_group_observe_attribution(_continuation))
+                await self._route_guest_clarify_continuation(
+                    chat_id_str, _continuation_pair, guest_query_id)
                 return
 
         # Concurrency ceiling, the thread, the busy guard and the turn itself — shared with the
@@ -8914,6 +9123,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # On this event only, and on nothing the caller sends next: their following messages
             # build their own source and meet the same refusal as before.
             event.source = dataclasses.replace(event.source, participation_authorized=True)
+            # Whose request this turn IS. A question the request asks is part of the request, so
+            # this person may answer it — and nothing else (see _guest_allow_once_can_answer).
+            self._guest_allow_once_authors[_turn_key] = str(caller_id)
 
         # Session isolation per guest caller falls out of _build_message_event for
         # free now: it reads user_id/user_name straight off msg.from_user, which is
